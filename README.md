@@ -13,6 +13,23 @@
 3. Проверка: `tail -f logs/galileosky_ingest.log` — должны идти новые строки; `ls data/pipeline_storage/<дата>/events.jsonl` — появляются события.
 4. На стороне ретранслятора включить **полный бинарный Galileosky** (с навигационным тегом 0x30). Пока ретранслятор отдаёт урезанные кадры без координат, lat/lon не пишутся. При появлении 0x30 парсер автоматически начнёт сохранять координаты и RS485.
 
+## Кратко об актуальной схеме (2025‑12)
+
+- Ingest (`pipeline/cli/run_stream.py`) пишет события в `data/pipeline_storage/<YYYY-MM-DD>/events*.jsonl` **и** в Postgres (`events`), если задан `DEVICE_REGISTRY_DSN`/`DATABASE_URL`.
+- Trip worker (`pipeline/cli/run_trip_worker.py`) читает `events` из Postgres, хранит состояние/курсор в Redis и пишет поездки в `trips`.
+- UI Monitoring v2 (кнопка 📅) использует `/web/api/history/trips|track`; история берётся из таблиц `events`/`trips`.
+- Shadow/Inbox: Redis + API в `pipeline/api/web_v2.py`, локальные Leaflet‑ассеты лежат в `web/static/vendor/leaflet/` (без CDN).
+
+### Если нет поездок в UI
+1. `psql "$DEVICE_REGISTRY_DSN" -c "select count(*) from events;"` — должны быть записи.
+2. `psql "$DEVICE_REGISTRY_DSN" -c "select count(*) from trips;"` — должно расти, если trip_worker запущен.
+3. Если events только в файлах — импортируй их:
+   ```bash
+   .venv/bin/python scripts/import_events_to_db.py
+   ```
+4. Убедись, что run_stream и trip_worker используют один DSN и Redis.
+
+
 Единый документ по текущему состоянию проекта на 2025‑11‑22.  
 После прочтения должно быть понятно:
 

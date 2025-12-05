@@ -230,8 +230,8 @@ cmd+=(PYTHONPATH=. "${PYTHON_BIN}" pipeline/cli/run_all.py --units "${RUN_UNITS}
 [[ "${NO_WEB}" == "1" ]] && cmd+=(--no-web)
 [[ "${NO_SNAPSHOT}" == "1" ]] && cmd+=(--no-snapshot)
 
-echo "  -> cmd: ${cmd[*]}"
-nohup "${cmd[@]}" >>"${RUNALL_LOGFILE}" 2>&1 &
+echo "  -> cmd: (cd ${ROOT} && ${cmd[*]})"
+(cd "${ROOT}" && nohup "${cmd[@]}") >>"${RUNALL_LOGFILE}" 2>&1 &
 echo $! > "${RUNALL_PIDFILE}"
 
 echo "[stack] started successfully (PID $(cat ${RUNALL_PIDFILE}))."

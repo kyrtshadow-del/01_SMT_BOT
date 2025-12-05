@@ -1,0 +1,99 @@
+{
+  "type": "avl_unit",
+  "version": "b4",
+  "mu": 0,
+  "general": {
+    "n": "Demo Unit",
+    "uid": "123456789012345",
+    "uid2": "",
+    "ph": "+1000000000",
+    "ph2": "",
+    "psw": "",
+    "hw": "Galileosky 7x"
+  },
+  "icon": {
+    "lib": "1",
+    "url": "demo.png",
+    "imgRot": "0"
+  },
+  "hwConfig": {
+    "hw": "Galileosky 7x",
+    "fullData": 1,
+    "params": [
+      {
+        "name": "reg_photo_curr_time",
+        "label": "Register a photo with the current time",
+        "type": "bool",
+        "value": "0",
+        "description": "Register a photo with the current time",
+        "default": "0",
+        "readonly": 0,
+        "minval": 0,
+        "maxval": 0
+      }
+    ]
+  },
+  "counters": {
+    "cfl": 100,
+    "cnm": 5000
+  },
+  "advProps": {
+    "monitoring_sensor": "10",
+    "track_speed": "0 3eff7f;6 0ab743"
+  },
+  "profile": [
+    {
+      "id": 1,
+      "n": "Garage",
+      "v": "Main",
+      "ct": 1600000000,
+      "mt": 1600000000
+    }
+  ],
+  "intervals": [
+    {
+      "id": 2,
+      "n": "Default",
+      "t": 0,
+      "im": 60
+    }
+  ],
+  "sensors": [
+    {
+      "id": 10,
+      "n": "Fuel level",
+      "t": "fuel_level",
+      "d": "Main tank sensor",
+      "m": "l",
+      "p": "fuel_param",
+      "f": 0,
+      "c": "{\"pos\":1}",
+      "vt": 2,
+      "vs": 0,
+      "tbl": [
+        {
+          "x": 0,
+          "a": 0,
+          "b": 0
+        },
+        {
+          "x": 1000,
+          "a": 0.25,
+          "b": 0
+        }
+      ],
+      "ct": 1700000000,
+      "mt": 1700000500
+    }
+  ],
+  "reportProps": {
+    "speedLimit": 90
+  },
+  "aliases": [],
+  "driving": {
+    "minSat": 4
+  },
+  "trip": {
+    "minTripDistance": 500
+  }
+}

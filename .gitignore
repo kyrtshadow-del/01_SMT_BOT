@@ -1,0 +1,44 @@
+# Python cache / environments
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.env
+.venv/
+
+# Editors / OS
+.DS_Store
+*.swp
+*.swo
+*.orig
+
+# Project artifacts
+data/
+logs/
+*.log
+*.gz
+*.zip
+*.tar
+*.tgz
+tmp_*.txt
+*.tmp
+*.bak
+
+# Local exports / dumps
+Wialon Message/
+Карточка объекта/
+OLD VERSION/
+account_data.json
+account_get_account_data.html
+core_get_account_data.html
+tmp_wialon*.*
+
+# Misc scratch / generated files
+scratch/
+tmp_*/
+*.iml
+*.code-workspace

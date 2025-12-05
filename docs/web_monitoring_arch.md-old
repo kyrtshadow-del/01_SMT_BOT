@@ -1,0 +1,43 @@
+# WEB Monitoring (SMT Local) — архитектура и инварианты
+
+## Слои
+- **Данные**: `UnitSnapshotService` (`data/unit_snapshot.json.gz`), `LatestTelemetryStore` (`latest_metrics.json`), `UnitConfigService` (`unit_configs/*.json`).
+- **Статусы**: `pipeline/engine/status.py` — `compute_status()` определяет `online/offline`, движение, `has_fuel`.
+- **API**: `pipeline/api/monitoring.py` + модели `pipeline/api/monitoring_models.py`; HTML/статика — `pipeline/api/web_app.py`.
+- **UI**: `web/templates/index.html`, `web/static/index.css`, `web/static/index.js` (карта Leaflet, виртуальный список, worklist, модалка).
+
+## HTTP‑эндпоинты (/monitoring)
+- `POST /monitoring/api/session` → `{session_id}` (принимает опциональный `token` из URL `?token=`).
+- `GET /monitoring/api/units` → список `UnitListItem` (id, name, online, status, lat/lon, has_fuel, hw, uid). Фильтры: `q`, `online`, `has_fuel`.
+- `GET /monitoring/api/units/{id}` → `UnitDetail` (item + snapshot + latest + unit_config + status_details).
+- `GET /monitoring/api/worklist` → `[unit_id]` для сессии.
+- `POST /monitoring/api/worklist` → добавить `unit_ids`.
+- `PUT /monitoring/api/worklist` → заменить списком `unit_ids`.
+- `DELETE /monitoring/api/worklist/{id}` → удалить из worklist.
+- HTML: `GET /monitoring/` и `/` → `index.html`; статика по `/static/*`.
+
+## Сессии и worklist
+- Клиент при старте вызывает `/monitoring/api/session` и сохраняет `session_id` в `localStorage` (`smt_session_id`).
+- Все API‑вызовы передают заголовок `X-Session-Id`.
+- Worklist хранится помимо сессии в `data/web_sessions/<session>.json`, не глобален.
+
+## Виртуализация списка (10k+ объектов)
+- Фиксированная высота строки: CSS `.unit-item { height: 64px; }`, JS `rowHeight` измеряется в `computeRowHeight()`, дефолт 64 px.
+- DOM‑пул: от 32 до 140 строк (`MIN_POOL..MAX_POOL`), хранится в `pool`.
+- При `scroll` вычисляется окно: `start = floor(scrollTop/rowHeight) - overscan(6)`, `end = start + visible + overscan*2`.
+- Строки позиционируются через `transform: translateY(index * rowHeight)`; `listInner.height = total * rowHeight`.
+- Инварианты: хвост достигаем, отсутствие «дрожания» при микроскролле, O(100) DOM‑нод независимо от 10k элементов.
+
+## Карта
+- Leaflet + MarkerCluster (`chunkedLoading` включён). При клике по строке/маркеру грузится `/monitoring/api/units/{id}`, карта фокусируется на объекте.
+- Кластеры отключаются на `zoom>=16`.
+
+## Проверки производительности/смоук
+1) 10k объектов: скролл вниз/вверх — без зависаний, без ошибок в консоли; хвост достижим.
+2) Фильтры/поиск: ввод в поиск, переключение online/has_fuel (план) — список и карта обновляются без перерисовки всего DOM.
+3) Worklist: добавление 100+ объектов, переключение «Все/Рабочий» — без заметного лага.
+4) Ресайз панели/окна: список корректно пересчитывает высоту (`computeRowHeight`, `ensurePool`).
+
+## Интеграция с ботом
+- Бот отдаёт ссылку `/monitoring/?token=<one-time>`. Токен сейчас сохраняется в сессии (валидация минимальная); расширение: проверка токена и сроков жизни.
+

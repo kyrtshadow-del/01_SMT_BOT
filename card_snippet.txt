@@ -1,0 +1,441 @@
+14480:             if value:
+14481:                 params_map[key] = value
+14482: 
+14483:     pos = item.get("pos") or {}
+14484:     lmsg = item.get("lmsg") or {}
+14485:     last_ts = lmsg.get("t") or pos.get("t")
+14486:     sats = pos.get("sc")
+14487:     online = _is_online(last_ts)
+14488:     online_emoji = "🟢" if online else "🔴"
+14489:     online_text = f"{online_emoji} На связи" if online else f"{online_emoji} Нет связи"
+14490: 
+14491:     fuel_line = ""
+14492:     sensor = WialonClient._pick_fuel_sensor(item)
+14493:     fuel_task = None
+14494:     if sensor:
+14495:         sensor_id = int(sensor.get("id"))
+14496: 
+14497:         def _calc_fuel() -> Optional[float]:
+14498:             try:
+14499:                 client.load_last_message(unit_id)
+14500:             except Exception:
+14501:                 pass
+14502:             return client.calc_sensor_value(unit_id, sensor_id)
+14503: 
+14504:         fuel_task = asyncio.create_task(run_blocking(_calc_fuel))
+14505: 
+14506:     sat_dot, sat_ago = _human_ago(pos.get("t"))
+14507:     sats_text = f"{sats} спутн." if sats is not None else "—"
+14508:     lat_raw = pos.get("y") if isinstance(pos, dict) else None
+14509:     if lat_raw is None and isinstance(pos, dict):
+14510:         lat_raw = pos.get("lat")
+14511:     lon_raw = pos.get("x") if isinstance(pos, dict) else None
+14512:     if lon_raw is None and isinstance(pos, dict):
+14513:         lon_raw = pos.get("lon")
+14514:     try:
+14515:         lat_val = float(lat_raw) if lat_raw is not None else None
+14516:     except Exception:
+14517:         lat_val = None
+14518:     try:
+14519:         lon_val = float(lon_raw) if lon_raw is not None else None
+14520:     except Exception:
+14521:         lon_val = None
+14522: 
+14523:     address_text = _extract_address_from_pos(pos)
+14524: 
+14525:     target = update_or_q.message
+14526:     reverse_geocode_task = None
+14527:     geozone_task = None
+14528:     map_bytes_task = None
+14529:     if lat_val is not None and lon_val is not None:
+14530:         if not address_text:
+14531:             reverse_geocode_task = asyncio.create_task(
+14532:                 run_blocking(client.reverse_geocode, lat_val, lon_val)
+14533:             )
+14534:         geozone_task = asyncio.create_task(
+14535:             run_blocking(client.get_unit_geozone_details, unit_id, lat_val, lon_val)
+14536:         )
+14537:         if target:
+14538:             map_bytes_task = asyncio.create_task(
+14539:                 run_blocking(_download_yandex_static_map, lat_val, lon_val)
+14540:             )
+14541:     dut_lines_task = asyncio.create_task(run_blocking(_build_dut_lines2, client, item, unit_id))
+14542: 
+14543:     if reverse_geocode_task:
+14544:         try:
+14545:             geocoded = await reverse_geocode_task
+14546:         except Exception as exc:
+14547:             geocoded = None
+14548:             log.debug('reverse_geocode call failed: %s', exc)
+14549:         if geocoded:
+14550:             address_text = geocoded
+14551: 
+14552:     coords_text = _format_coords(lat_val, lon_val)
+14553:     if address_text and coords_text:
+14554:         location_display = f"{coords_text} — {address_text}"
+14555:     else:
+14556:         location_display = address_text or coords_text or ''
+14557:     location_map_url = _build_map_url(address=address_text, lat=lat_val, lon=lon_val)
+14558:     geozone_label = "Геозона"
+14559:     geozone_display = "вне зон"
+14560:     geozone_map_url: Optional[str] = None
+14561:     primary_zone: Optional[Dict[str, Any]] = None
+14562:     geozone_payload: Dict[str, Any] = {}
+14563:     if geozone_task:
+14564:         try:
+14565:             result = await geozone_task
+14566:         except Exception as exc:
+14567:             geozone_payload = {}
+14568:             geo_log.debug("get_unit_geozone_details failed: %s", exc)
+14569:         else:
+14570:             geozone_payload = result if isinstance(result, dict) else {}
+14571:     names_ordered: List[str] = []
+14572:     geozone_entries: List[Dict[str, Any]] = []
+14573:     if isinstance(geozone_payload, dict):
+14574:         raw_names = geozone_payload.get("names") or []
+14575:         if isinstance(raw_names, list):
+14576:             for name in raw_names:
+14577:                 name_str = str(name).strip()
+14578:                 if name_str:
+14579:                     names_ordered.append(name_str)
+14580:         raw_entries = geozone_payload.get("entries") or []
+14581:         if isinstance(raw_entries, list):
+14582:             geozone_entries = [dict(entry) for entry in raw_entries if isinstance(entry, dict)]
+14583: 
+14584:     if names_ordered:
+14585:         geozone_label = "Геозоны"
+14586:         display_parts: List[str] = [f"📍 {name}" for name in names_ordered[:GEO_MAX_NAMES]]
+14587:         if len(names_ordered) > GEO_MAX_NAMES:
+14588:             extra = len(names_ordered) - GEO_MAX_NAMES
+14589:             display_parts.append(f"… и ещё {extra}")
+14590:         geozone_display = ", ".join(display_parts)
+14591:         if geozone_entries:
+14592:             primary_zone = dict(geozone_entries[0])
+14593: 
+14594:     geo_log.debug(
+14595:         "zones_render: names=%s",
+14596:         ", ".join(names_ordered) if names_ordered else "—",
+14597:     )
+14598: 
+14599:     if primary_zone:
+14600:         g_lat = primary_zone.get("lat")
+14601:         g_lon = primary_zone.get("lon")
+14602:         if (g_lat is None or g_lon is None) and primary_zone.get("resource_id") and primary_zone.get("zone_id"):
+14603:             try:
+14604:                 center = await run_blocking(
+14605:                     client.get_zone_center,
+14606:                     int(primary_zone["resource_id"]),
+14607:                     int(primary_zone["zone_id"]),
+14608:                 )
+14609:             except Exception as exc:
+14610:                 center = None
+14611:                 geo_log.debug("get_zone_center failed: %s", exc)
+14612:             if center:
+14613:                 g_lat, g_lon = center
+14614:                 primary_zone["lat"], primary_zone["lon"] = center
+14615:         addr = str(primary_zone.get("name") or "").strip() or None
+14616:         if g_lat is not None and g_lon is not None:
+14617:             geozone_map_url = _build_map_url(address=addr, lat=g_lat, lon=g_lon)
+14618: 
+14619:     def _extract_text(value: Any) -> Optional[str]:
+14620:         if isinstance(value, str):
+14621:             text = value.strip()
+14622:             return text or None
+14623:         if isinstance(value, (int, float)):
+14624:             return str(value)
+14625:         if isinstance(value, dict):
+14626:             for key in ("n", "nm", "name", "value", "val", "title"):
+14627:                 if key in value:
+14628:                     nested = _extract_text(value.get(key))
+14629:                     if nested:
+14630:                         return nested
+14631:             for nested in value.values():
+14632:                 text = _extract_text(nested)
+14633:                 if text:
+14634:                     return text
+14635:         if isinstance(value, (list, tuple)):
+14636:             for item_nested in value:
+14637:                 text = _extract_text(item_nested)
+14638:                 if text:
+14639:                     return text
+14640:         return None
+14641: 
+14642:     def _deep_search(source: Any, keys: List[str]) -> Optional[str]:
+14643:         if source is None:
+14644:             return None
+14645:         key_set = {key.casefold() for key in keys}
+14646:         stack: List[Any] = [source]
+14647:         seen: Set[int] = set()
+14648:         while stack:
+14649:             current = stack.pop()
+14650:             ident = id(current)
+14651:             if ident in seen:
+14652:                 continue
+14653:             seen.add(ident)
+14654:             if isinstance(current, dict):
+14655:                 for key, val in current.items():
+14656:                     key_cf = key.casefold() if isinstance(key, str) else None
+14657:                     if key_cf and key_cf in key_set:
+14658:                         candidate = _extract_text(val)
+14659:                         if candidate:
+14660:                             return candidate
+14661:                     stack.append(val)
+14662:             elif isinstance(current, (list, tuple)):
+14663:                 stack.extend(current)
+14664:         return None
+14665: 
+14666:     def _get_from_params(params: Dict[str, str], keys: List[str]) -> Optional[str]:
+14667:         lowered_map = {k.casefold(): v for k, v in params.items()}
+14668:         for key in keys:
+14669:             value = lowered_map.get(key.casefold())
+14670:             if value:
+14671:                 text = _extract_text(value)
+14672:                 if text:
+14673:                     return text
+14674:         return None
+14675: 
+14676:     info_wialon_id = _get_from_params(
+14677:         params_map,
+14678:         ["monitoring_units_custom_row", "wialon_id", "unit_id", "object_id"],
+14679:     )
+14680:     if not info_wialon_id:
+14681:         info_wialon_id = _deep_search(
+14682:             item,
+14683:             [
+14684:                 "monitoring_units_custom_row",
+14685:                 "wialon_id",
+14686:                 "unit_id",
+14687:                 "object_id",
+14688:                 "wialon_object_id",
+14689:             ],
+14690:         )
+14691:     if not info_wialon_id and unit_id:
+14692:         info_wialon_id = str(unit_id)
+14693: 
+14694:     info_device_type = _get_from_params(
+14695:         params_map,
+14696:         [
+14697:             "device_type",
+14698:             "hardware",
+14699:             "hardware_name",
+14700:             "device",
+14701:             "hw_name",
+14702:             "terminal_type",
+14703:         ],
+14704:     )
+14705:     if not info_device_type:
+14706:         info_device_type = _deep_search(
+14707:             item,
+14708:             [
+14709:                 "device_type",
+14710:                 "hardware",
+14711:                 "hardware_name",
+14712:                 "device",
+14713:                 "hw_name",
+14714:                 "terminal_type",
+14715:             ],
+14716:         )
+14717:     if not info_device_type:
+14718:         if device_type_name:
+14719:             info_device_type = device_type_name
+14720:         elif device_type_id is not None:
+14721:             info_device_type = str(device_type_id)
+14722: 
+14723:     info_terminal_id = _get_from_params(
+14724:         params_map,
+14725:         ["terminal_id", "terminal", "uid", "unique_id", "imei", "serial", "serial_number"],
+14726:     )
+14727:     if not info_terminal_id:
+14728:         info_terminal_id = _deep_search(
+14729:             item,
+14730:             ["terminal_id", "terminal", "uid", "unique_id", "imei", "serial", "serial_number"],
+14731:         )
+14732:     if not info_terminal_id and device_uid:
+14733:         info_terminal_id = device_uid
+14734: 
+14735:     info_driver = _get_from_params(
+14736:         params_map,
+14737:         [
+14738:             "driver_name",
+14739:             "assigned_driver",
+14740:             "driver",
+14741:             "driver_full_name",
+14742:             "driver_nm",
+14743:         ],
+14744:     )
+14745:     if not info_driver:
+14746:         info_driver = _deep_search(
+14747:             item,
+14748:             [
+14749:                 "driver_name",
+14750:                 "assigned_driver",
+14751:                 "driver",
+14752:                 "driver_full_name",
+14753:                 "driver_nm",
+14754:                 "driver_title",
+14755:             ],
+14756:         )
+14757:     if not info_driver and driver_display_text:
+14758:         info_driver = driver_display_text
+14759: 
+14760:     def _display_or_dash(value: Optional[str]) -> str:
+14761:         return value if value else "—"
+14762: 
+14763:     def _append_group(heading: str, entries: List[str]) -> List[int]:
+14764:         if not entries:
+14765:             return []
+14766:         if lines:
+14767:             lines.append("")
+14768:         lines.append(heading)
+14769:         start_idx = len(lines)
+14770:         lines.extend(entries)
+14771:         return list(range(start_idx, start_idx + len(entries)))
+14772:     if fuel_task:
+14773:         try:
+14774:             fuel_value = await fuel_task
+14775:         except Exception as exc:
+14776:             log.warning("Не удалось получить расчётное значение топлива по ДУТ: %s", exc)
+14777:         else:
+14778:             normalized = normalize_fuel_value(fuel_value)
+14779:             if normalized is not None and FUEL_MIN_VALID_L <= normalized <= FUEL_MAX_VALID_L:
+14780:                 formatted = format_liters(normalized)
+14781:                 if formatted is not None:
+14782:                     fuel_line = f"{formatted} л"
+14783: 
+14784: 
+14785:     lines: List[str] = []
+14786:     general_entries = [
+14787:         f"• Имя: {unit_name}",
+14788:         f"• Связь: {online_text}",
+14789:         f"• Спутники: {sat_dot} определены {sat_ago} назад ({sats_text})",
+14790:         f"• Последнее сообщение: {_fmt_ts_utc(last_ts)}",
+14791:         f"• ДУТ (уровень топлива): {_display_or_dash(fuel_line)}",
+14792:         f"• Назначенный водитель: {_display_or_dash(info_driver)}",
+14793:     ]
+14794:     _append_group("🧾 Общая информация", general_entries)
+14795: 
+14796:     location_entries = [
+14797:         f"• Локация: {location_display}",
+14798:         f"• {geozone_label}: {geozone_display}",
+14799:     ]
+14800:     location_indices = _append_group("🗺️ Местоположение", location_entries)
+14801: 
+14802:     device_dut_lines: List[str] = []
+14803:     try:
+14804:         dut_lines = await dut_lines_task
+14805:     except Exception as e:
+14806:         log.warning("build_dut_lines failed: %s", e)
+14807:     else:
+14808:         if isinstance(dut_lines, list) and dut_lines:
+14809:             processed: List[str] = []
+14810:             for raw_line in dut_lines:
+14811:                 normalized_line = str(raw_line or "").strip()
+14812:                 if normalized_line:
+14813:                     processed.append(normalized_line)
+14814:             if processed:
+14815:                 device_dut_lines = processed
+14816:     if device_dut_lines:
+14817:         dut_label_prefix = "• ДУТ (уровень топлива):"
+14818:         device_dut_lines = [
+14819:             line
+14820:             for line in device_dut_lines
+14821:             if not line.strip().startswith(dut_label_prefix)
+14822:         ]
+14823: 
+14824:     device_entries = list(device_dut_lines)
+14825:     device_entries.append(f"• ID объекта Wialon: {_display_or_dash(info_wialon_id)}")
+14826:     device_entries.append(f"• Тип устройства: {_display_or_dash(info_device_type)}")
+14827:     device_entries.append(f"• ID терминала: {_display_or_dash(info_terminal_id)}")
+14828:     _append_group("🆔 Параметры устройства", device_entries)
+14829: 
+14830:     links_map: Dict[int, Tuple[str, str]] = {}
+14831:     if location_map_url and location_display != "—" and location_indices:
+14832:         links_map[location_indices[0]] = (location_display, location_map_url)
+14833:     if (
+14834:         geozone_map_url
+14835:         and geozone_display not in ("—", "вне зон")
+14836:         and len(location_indices) > 1
+14837:     ):
+14838:         links_map[location_indices[1]] = (geozone_display, geozone_map_url)
+14839: 
+14840:     message_html = _format_lines_with_links(lines, links_map)
+14841:     _card_stage(
+14842:         "payload_ready",
+14843:         line_count=len(lines),
+14844:         has_coordinates=bool(lat_val is not None and lon_val is not None),
+14845:     )
+14846:     map_caption = None
+14847:     map_caption_parse_mode = None
+14848: 
+14849:     try:
+14850:         msg = await target.reply_text(
+14851:             message_html,
+14852:             reply_markup=kb_stats_actions_with_refresh(),
+14853:             parse_mode="HTML",
+14854:             disable_web_page_preview=True,
+14855:         )
+14856:     except Exception as exc:
+14857:         _card_stage("card_send_error", error=type(exc).__name__)
+14858:         raise
+14859:     _card_stage("card_sent", message_id=msg.message_id, line_count=len(lines))
+14860:     context.user_data["stats_msg"] = {"chat_id": msg.chat_id, "message_id": msg.message_id}
+14861:     _set_objects_mode(context, OBJECTS_MODE_CARD_IDLE)
+14862: 
+14863:     map_kind = "none"
+14864:     map_msg = None
+14865:     map_bytes_obtained = False
+14866:     map_bytes = None
+14867:     if map_bytes_task and target and lat_val is not None and lon_val is not None:
+14868:         try:
+14869:             map_bytes = await map_bytes_task
+14870:             map_bytes_obtained = bool(map_bytes)
+14871:         except Exception as exc:
+14872:             map_bytes = None
+14873:             log.debug("download_static_map failed: %s", exc)
+14874:         if map_bytes:
+14875:             photo_stream = io.BytesIO(map_bytes)
+14876:             photo_stream.name = "yandex_map.png"
+14877:             map_file = InputFile(photo_stream, filename="yandex_map.png")
+14878:             try:
+14879:                 map_msg = await target.reply_photo(
+14880:                     photo=map_file,
+14881:                     caption=map_caption,
+14882:                     parse_mode=map_caption_parse_mode,
+14883:                 )
+14884:                 map_kind = "photo"
+14885:             except Exception as exc:
+14886:                 log.debug("send_map_photo failed: %s", exc)
+14887:                 map_msg = None
+14888:         if map_msg is None and lat_val is not None and lon_val is not None:
+14889:             try:
+14890:                 map_msg = await target.reply_location(
+14891:                     latitude=float(lat_val),
+14892:                     longitude=float(lon_val),
+14893:                     disable_notification=True,
+14894:                 )
+14895:                 if map_msg is not None:
+14896:                     map_kind = "location"
+14897:             except Exception as exc:
+14898:                 log.debug("send_location failed: %s", exc)
+14899:                 map_msg = None
+14900:     if map_msg is not None:
+14901:         new_map_meta = {
+14902:             "chat_id": map_msg.chat_id,
+14903:             "message_id": map_msg.message_id,
+14904:         }
+14905:         context.user_data["stats_map_msg"] = new_map_meta
+14906:         if prev_map_meta and (
+14907:             prev_map_meta.get("chat_id") != map_msg.chat_id
+14908:             or prev_map_meta.get("message_id") != map_msg.message_id
+14909:         ):
+14910:             try:
+14911:                 await context.bot.delete_message(
+14912:                     chat_id=prev_map_meta["chat_id"],
+14913:                     message_id=prev_map_meta["message_id"],
+14914:                 )
+14915:             except Exception as exc:
+14916:                 log.debug("cleanup old map failed: %s", exc)
+14917:         _card_stage("map_sent", map_kind=map_kind)
+14918:     else:
+14919:         _card_stage("map_skipped", candidate=map_bytes_obtained)
+14920:     _card_stage("done")

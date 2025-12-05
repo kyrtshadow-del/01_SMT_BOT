@@ -1,0 +1,14 @@
+[Unit]
+Description=Recalculate expected telemetry intervals (SMT Local)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/hearo/project/mybot
+Environment="PYTHONPATH=."
+ExecStart=/bin/bash -lc 'source .venv/bin/activate 2>/dev/null || true; ./scripts/recalc_expected_intervals.sh --window-days 2 --recalc-period-hours 12 --max-units 200 --online-threshold-sec ${MONITORING_ONLINE_SEC:-600}'
+User=hearo
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

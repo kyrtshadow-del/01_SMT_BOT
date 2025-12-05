@@ -1,0 +1,242 @@
+# UnitConfig Schema (Draft v1)
+
+This document fixes the canonical structure for our unified unit configuration snapshot (`UnitConfig`).  
+It mirrors the dataclasses in `pipeline/config/unit_config.py` and is designed to be a superset of the data
+we import from Wialon `.wlp` exports. The same schema will be used when we populate objects from other
+telemetry providers, so every section keeps flexible `extra`/`meta` blocks for vendor-specific fields.
+For machine validation the JSON schema is also stored as `pipeline/config/unit_config.schema.json`.
+
+## Sections
+
+| Section | Dataclass | Purpose |
+| --- | --- | --- |
+| `general` | `GeneralConfig` | Identity: name, UID/IMEI, phones, password/pins, hardware tag |
+| `icon` | `IconConfig` | Marker/icon metadata for UI |
+| `hw_config` | `HWConfig` + `HWParam` | Tracker configuration parameters and flags |
+| `sensors[]` | `SensorConfig` | Unified sensor definitions (type, formulas, validation, calibration) |
+| `sensors[].calibration` | `SensorCalibration` + `CalibrationPoint`/`CalibrationSegment` | Piecewise-linear conversion tables and XY points |
+| `sensors[].validation` | `SensorValidation` | Value filters (min/max, hysteresis, quality flags) |
+| `counters` | `CounterConfig` | Runtime counters (mileage, engine hours, total fuel) |
+| `profile[]` | `ProfileField` | Custom attributes defined by operator |
+| `intervals[]` | `IntervalConfig` | Notification/collection interval presets |
+| `report_props` | `Dict[str, Any]` | Defaults for analytics/reports |
+| `aliases[]` | `Dict[str, Any]` | Localized names/tags |
+| `driving`, `trip` | `Dict[str, Any]` | Trip detection and driver behaviour presets |
+| `advanced` | `Dict[str, Any]` | Advanced options (primary sensors, styles, etc.) |
+| `extra` | `Dict[str, Any]` | Future-proof storage for any unknown section |
+
+### Sensor calibration detail
+
+Each sensor may have both raw XY points (exactly as entered by the operator) and the derived linear
+segments used for fast calculation (`Y = a * X + b`). `segments[].start_x` marks the beginning of a
+piecewise range. Tanks or complex sensors can be distinguished via `tank_id`. When importing Wialon
+tables we store both representations so they can be exported back without loss.
+
+### Validation and expressions
+
+`SensorConfig.parameters` contains the source formulas/expression tree (e.g. `p1`, `p2`, `flags`,
+bit masks). `expression` is a normalized textual form we can evaluate locally. `SensorValidation`
+stores the policy chosen in UI (`mode`, bounds, hysteresis) plus `params` for type-specific options.
+
+## JSON Schema
+
+The following JSON Schema (draft 2020-12) formalizes the structure. Optional objects may be omitted
+or set to `null`; arrays default to empty.
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cfbot.local/schemas/unit_config.json",
+  "title": "UnitConfig",
+  "type": "object",
+  "required": ["unit_id", "source_kind"],
+  "properties": {
+    "unit_id": {"type": "integer"},
+    "source_kind": {"type": "string"},
+    "dump_ts": {"type": "integer"},
+    "general": {"$ref": "#/$defs/GeneralConfig"},
+    "icon": {"$ref": "#/$defs/IconConfig"},
+    "hw_config": {"$ref": "#/$defs/HWConfig"},
+    "counters": {"$ref": "#/$defs/CounterConfig"},
+    "advanced": {"type": "object", "additionalProperties": {}},
+    "profile": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/ProfileField"}
+    },
+    "intervals": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/IntervalConfig"}
+    },
+    "sensors": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/SensorConfig"}
+    },
+    "report_props": {"type": "object", "additionalProperties": {}},
+    "aliases": {
+      "type": "array",
+      "items": {"type": "object", "additionalProperties": {}}
+    },
+    "driving": {"type": "object", "additionalProperties": {}},
+    "trip": {"type": "object", "additionalProperties": {}},
+    "extra": {"type": "object", "additionalProperties": {}}
+  },
+  "$defs": {
+    "GeneralConfig": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string"},
+        "uid": {"type": "string"},
+        "uid2": {"type": "string"},
+        "phone": {"type": "string"},
+        "phone2": {"type": "string"},
+        "password": {"type": "string"},
+        "hardware": {"type": "string"},
+        "extra": {"type": "object", "additionalProperties": {}}
+      }
+    },
+    "IconConfig": {
+      "type": "object",
+      "properties": {
+        "library": {"type": "string"},
+        "url": {"type": "string"},
+        "rotation_mode": {"type": "string"},
+        "extra": {"type": "object", "additionalProperties": {}}
+      }
+    },
+    "HWConfig": {
+      "type": "object",
+      "properties": {
+        "hardware": {"type": "string"},
+        "full_data": {"type": "boolean"},
+        "params": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/HWParam"}
+        },
+        "extra": {"type": "object", "additionalProperties": {}}
+      }
+    },
+    "HWParam": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string"},
+        "label": {"type": "string"},
+        "type": {"type": "string"},
+        "value": {},
+        "default": {},
+        "description": {"type": "string"},
+        "readonly": {"type": "boolean"},
+        "minval": {"type": "number"},
+        "maxval": {"type": "number"},
+        "extra": {"type": "object", "additionalProperties": {}}
+      }
+    },
+    "CounterConfig": {
+      "type": "object",
+      "properties": {
+        "values": {"type": "object", "additionalProperties": {"type": "number"}}
+      }
+    },
+    "ProfileField": {
+      "type": "object",
+      "required": ["field_id", "name", "value"],
+      "properties": {
+        "field_id": {"type": "integer"},
+        "name": {"type": "string"},
+        "value": {},
+        "meta": {"type": "object", "additionalProperties": {}}
+      }
+    },
+    "IntervalConfig": {
+      "type": "object",
+      "required": ["interval_id", "name"],
+      "properties": {
+        "interval_id": {"type": "integer"},
+        "name": {"type": "string"},
+        "params": {"type": "object", "additionalProperties": {}}
+      }
+    },
+    "SensorConfig": {
+      "type": "object",
+      "required": ["sensor_id", "name", "type"],
+      "properties": {
+        "sensor_id": {"type": "integer"},
+        "name": {"type": "string"},
+        "type": {"type": "string"},
+        "units": {"type": "string"},
+        "description": {"type": "string"},
+        "parameters": {"type": "object", "additionalProperties": {}},
+        "expression": {"type": "string"},
+        "validation": {"$ref": "#/$defs/SensorValidation"},
+        "calibration": {"$ref": "#/$defs/SensorCalibration"},
+        "meta": {"type": "object", "additionalProperties": {}}
+      }
+    },
+    "SensorValidation": {
+      "type": "object",
+      "properties": {
+        "mode": {"type": "string"},
+        "min_value": {"type": "number"},
+        "max_value": {"type": "number"},
+        "hysteresis": {"type": "number"},
+        "params": {"type": "object", "additionalProperties": {}}
+      }
+    },
+    "SensorCalibration": {
+      "type": "object",
+      "required": ["sensor_id"],
+      "properties": {
+        "sensor_id": {"type": "integer"},
+        "tank_id": {"type": "string"},
+        "points": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/CalibrationPoint"}
+        },
+        "segments": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/CalibrationSegment"}
+        },
+        "smoothing": {"type": "object", "additionalProperties": {}},
+        "source": {"type": "string"},
+        "updated_at": {"type": "integer"},
+        "meta": {"type": "object", "additionalProperties": {}}
+      }
+    },
+    "CalibrationPoint": {
+      "type": "object",
+      "required": ["raw", "value"],
+      "properties": {
+        "raw": {"type": "number"},
+        "value": {"type": "number"}
+      }
+    },
+    "CalibrationSegment": {
+      "type": "object",
+      "required": ["start_x", "a", "b"],
+      "properties": {
+        "start_x": {"type": "number"},
+        "a": {"type": "number"},
+        "b": {"type": "number"}
+      }
+    }
+  },
+  "additionalProperties": false
+}
+```
+
+## Notes / Next Steps
+
+1. When new providers expose extra fields we extend dataclasses, update this schema, and bump the `$id` version.
+2. For persistence, configs are saved as JSON documents validated against the schema; binary exports (e.g. `.wlp`)
+   rely on adapters that map between vendor keys and our canonical names.
+3. Calibration editors should work on `points` and regenerate `segments` automatically to keep X a b consistent.
+
+This doc completes Step 1 of the plan (formal description of UnitConfig). Later steps will wire a config service,
+import/export pipelines, and UI/editor features on top of the same schema.
+
+## Importing Wialon `.wlp`
+
+Use `pipeline/adapters/wialon_wlp_import.py` (or the CLI `python -m pipeline.cli.import_wlp --unit-id ...`) to convert a Wialon
+`.wlp` export into `UnitConfig`. The importer maps `general`, `icon`, `hwConfig`, `sensors`, `counters`, `advProps`, `profile`,
+`intervals`, and other sections directly into the dataclasses described above, preserving unknown fields inside the `extra` maps.

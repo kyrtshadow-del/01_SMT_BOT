@@ -1,0 +1,10 @@
+[Unit]
+Description=Recalculate expected telemetry intervals every 30 minutes (SMT Local)
+
+[Timer]
+OnCalendar=*:0/30
+Persistent=true
+Unit=recalc_expected_intervals.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SMT Monitoring v2</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%234caf50' d='M8 0a5 5 0 0 0-5 5c0 3.75 5 11 5 11s5-7.25 5-11a5 5 0 0 0-5-5Zm0 7.5A2.5 2.5 0 1 1 8 2.5a2.5 2.5 0 0 1 0 5Z'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <link rel="stylesheet" href="/static/v2/app.css?v={{ static_version }}" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">SMT Local</div>
+    <div class="tab">Мониторинг v2</div>
+    <div class="spacer"></div>
+    <div class="user-block">
+      <span id="user-label">—</span>
+      <button id="btn-admin" class="ghost small">Админка</button>
+      <button id="btn-logout" class="ghost small">Выйти</button>
+    </div>
+    <button id="btn-shadow" title="Новые устройства">📡<span id="shadow-badge" class="badge hidden">0</span></button>
+    <button id="btn-refresh" title="Обновить">⟳</button>
+  </header>
+  
+  <div id="feed-alert" class="feed-alert hidden">Нет связи с сервером</div>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <!-- Основной список объектов -->
+      <div id="sidebar-main" class="sidebar-view">
+        <div class="search-row">
+          <div class="search-box">
+            <input id="search" type="text" placeholder="Поиск..." />
+          </div>
+          <div class="search-actions">
+            <!-- Фильтры (упрощено для читаемости, JS сам их оживит) -->
+            <button class="icon-btn status-toggle" data-group="connection"><span class="icon">●</span></button>
+            <button class="icon-btn status-toggle" data-group="motion"><span class="icon">🚘</span></button>
+            <button id="btn-add" class="primary square">+</button>
+          </div>
+          <!-- Попапы фильтров генерируются или скрыты в CSS -->
+          <div class="status-popup hidden" data-popup="connection"><button data-value="online">On</button><button data-value="offline">Off</button></div>
+          <div class="status-popup hidden" data-popup="motion"><button data-value="moving">Move</button><button data-value="stop">Stop</button></div>
+        </div>
+        <div class="tabs-row">
+          <div id="view-tabs" class="tabs"></div>
+          <button id="btn-add-tab" class="ghost small">+</button>
+        </div>
+        <div id="unit-list" class="unit-list"></div>
+      </div>
+
+      <!-- Панель Истории (Заменяет список) -->
+      <div id="sidebar-history" class="sidebar-view hidden">
+        <div class="history-header">
+          <button id="history-back" class="ghost icon" title="Назад к списку">⬅</button>
+          <div class="history-title-block">
+            <div id="history-unit-name" class="h-name">Unit</div>
+            <div class="h-dates">
+               <button class="date-nav" id="hist-prev">◀</button>
+               <input type="date" id="hist-date-picker">
+               <button class="date-nav" id="hist-next">▶</button>
+            </div>
+          </div>
+          <button id="history-refresh-btn" class="ghost icon" title="Обновить">⟳</button>
+        </div>
+        
+        <div class="history-summary" id="history-summary">
+           <!-- Заполняется JS -->
+        </div>
+
+        <div id="history-timeline" class="history-timeline">
+           <!-- Список поездок -->
+        </div>
+      </div>
+    </aside>
+
+    <div class="resizer" id="sidebar-resizer"></div>
+
+    <section class="map-area">
+      <div id="map"></div>
+      <!-- Инфо-плашка при наведении на трек -->
+      <div id="track-cursor-info" class="track-info-box hidden">
+        <div class="ti-row">
+          <div class="ti-time">--:--:--</div>
+          <div class="ti-speed">0 км/ч</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="bottombar">
+    <div id="status">Готов</div>
+    <div class="spacer"></div>
+    <div id="clock">00:00</div>
+  </footer>
+
+  <!-- Карточка объекта (плавающая) -->
+  <div id="unit-card" class="unit-card hidden"></div>
+  
+  <!-- Тултип на карте -->
+  <div id="unit-tooltip" class="unit-tooltip hidden"></div>
+
+  <!-- Модалки (Login, Admin, Add Unit, etc) остаются без изменений внизу -->
+  <div id="modal-overlay" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-header"><h3>Добавить объекты</h3><button id="modal-close">✕</button></div>
+      <div class="modal-filters"><input id="modal-name" placeholder="Имя"><input id="modal-uid" placeholder="UID"></div>
+      <div id="modal-list" class="modal-list"></div>
+      <div class="modal-actions">
+          <button id="modal-add-selected" class="primary">Добавить</button>
+          <button id="modal-cancel" class="ghost">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="login-overlay" class="modal-overlay hidden">
+    <div class="modal small">
+      <h3>Вход</h3>
+      <form id="login-form">
+        <input id="login-login" placeholder="Login" autocomplete="username"><input id="login-password" type="password" placeholder="Password" autocomplete="current-password">
+        <button id="login-submit" class="primary">Войти</button>
+        <div id="login-error" style="color:red"></div>
+      </form>
+    </div>
+  </div>
+  
+  <!-- Админка -->
+  <div id="admin-modal" class="modal-overlay hidden">
+     <div class="modal large">
+        <div class="modal-header"><h3>Админка</h3><button id="admin-close">✕</button></div>
+        <div class="modal-section"><pre id="admin-users"></pre></div>
+        <div class="modal-section">
+            <input id="admin-assign-units" placeholder="IDs"><button id="admin-assign-btn">Назначить</button>
+            <div id="admin-msg"></div>
+        </div>
+     </div>
+  </div>
+
+  <!-- Tabs config -->
+  <div id="tab-modal" class="modal-overlay hidden">
+    <div class="modal small">
+        <h3>Новая вкладка</h3>
+        <input id="tab-name" placeholder="Название">
+        <div id="tab-filter-rows"></div>
+        <button id="tab-filter-add">+</button>
+        <button id="tab-save" class="primary">Сохранить</button>
+        <button id="tab-cancel">Отмена</button>
+    </div>
+  </div>
+
+  <!-- Card settings -->
+  <div id="card-settings-modal" class="modal-overlay hidden">
+      <div class="modal small">
+          <h3>Настройки</h3>
+          <div id="card-order-list"></div>
+          <button id="card-settings-close">Закрыть</button>
+      </div>
+  </div>
+  
+  <!-- Trip detector settings -->
+  <div id="trip-modal" class="modal-overlay hidden">
+      <div class="modal small">
+          <h3>Детектор</h3>
+          <input id="trip-min-speed" placeholder="Скорость">
+          <button id="trip-save" class="primary">Сохранить</button>
+          <button id="trip-cancel">Отмена</button>
+      </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <script type="module" src="/static/v2/app.js?v={{ static_version }}"></script>
+</body>
+</html>

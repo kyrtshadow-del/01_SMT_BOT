@@ -1,0 +1,2542 @@
+const MAP_KEY = "smt_map_state_v2";
+const SESSION_KEY = "smt_session_v2";
+const SESSION_INFO_KEY = "smt_session_info_v1";
+const ROW_H = 60;
+const OVERSCAN = 6;
+const MIN_POOL = 40;
+const MAX_POOL = 160;
+const FIXED_CARD_KEYS = ["location"];
+const CARD_SECTIONS = [
+  { key: "sensors", title: "Датчики" },
+  { key: "connectivity", title: "Подключение" },
+  { key: "counters", title: "Счётчики" },
+  { key: "params", title: "Параметры" },
+  { key: "custom_fields", title: "Пользовательские поля" },
+  { key: "crew", title: "Экипаж" },
+  { key: "nearby", title: "Ближайшие" },
+  { key: "recent_events", title: "Последние сообщения" },
+];
+const CARD_SETTINGS_KEY = "smt_card_sections_v1";
+const CARD_ORDER_KEY = "smt_card_order_v1";
+const DETAIL_CACHE_TTL_MS = 60000; // longer cache to keep card data warm
+const ACTIVE_TAB_KEY = "smt_active_tab_v1";
+const TAB_STATE_KEY = "smt_tab_state_v1";
+const SIDEBAR_WIDTH_KEY = "smt_sidebar_width_v1";
+const RENDER_CARD_KEYS = [...FIXED_CARD_KEYS, ...CARD_SECTIONS.map((s) => s.key)];
+const DEFAULT_CARD_SECTIONS = CARD_SECTIONS.reduce((acc, s) => {
+  acc[s.key] = true;
+  return acc;
+}, {});
+const DEFAULT_CARD_ORDER = [...RENDER_CARD_KEYS];
+const DEFAULT_TABS = [{ id: "work", name: "Рабочий", filters: { worklist: true } }];
+const FEED_INTERVAL_MS = 10000;
+const SIDEBAR_MIN = 260;
+const SIDEBAR_MAX = 640;
+const quickFilters = { online: false, offline: false, moving: false, stop: false, parking: false, ign_on: false };
+
+function stripIgnitionText(text = "") {
+  return text.replace(/,?\s*зажиг\.?\s*(вкл|выкл)/gi, "").trim();
+}
+
+function formatUid(uid) {
+  if (!uid) return "";
+  const s = String(uid);
+  if (s.length <= 8) return s;
+  return `${s.slice(0, 4)}…${s.slice(-4)}`;
+}
+
+function cardSectionTitle(key) {
+  const item = CARD_SECTIONS.find((s) => s.key === key);
+  if (item) return item.title;
+  if (key === "nearby") return "Ближайшие";
+  return key;
+}
+
+function renderKvGrid(items, opts = {}) {
+  if (!items || !items.length) return "—";
+  const compact = opts.compact ? " compact" : "";
+  return `<div class="kv-grid">${items
+    .map((item) => {
+      const tone = item.tone ? ` tone-${item.tone}` : "";
+      const icon = item.icon ? `<span class="kv-icon">${item.icon}</span>` : "";
+      const label = item.label ? `<span class="kv-label">${item.label}</span>` : "";
+      const divider = item.label ? '<span class="kv-divider"></span>' : "";
+      const value = `<span class="kv-value">${item.value != null ? item.value : "—"}</span>`;
+      return `<div class="kv-pill${compact}${tone}">${icon}${label}${divider}${value}</div>`;
+    })
+    .join("")}</div>`;
+}
+
+let map;
+let cluster;
+let markerById = new Map();
+let units = [];
+let unitsById = new Map();
+let worklist = new Set();
+let current = [];
+let listEl, innerEl;
+let pool = [];
+let poolSize = 0;
+let selectedId = null;
+let modalState = { filtered: [], selected: new Set(), showOnMap: false };
+let modalRowById = new Map();
+let tooltipEl = null;
+let cardEl = null;
+let cardSettings = loadCardSettings();
+let cardOrder = loadCardOrder();
+let orderRowByKey = new Map();
+let panelTabs = [...DEFAULT_TABS];
+let activeTabId = loadActiveTab();
+let tabState = loadTabState();
+let currentCardDetail = null;
+let panelSettingsReady = false;
+let liveTimer = null;
+let liveInFlight = false;
+let feedSince = null;
+let lastLiveUpdated = null;
+let sidebarWidth = loadSidebarWidth();
+let resizerPointerId = null;
+let tabFilterRows = [];
+let expandedIndex = null;
+let cardHeight = 0;
+let cardVisible = false;
+const CARD_GAP = 6;
+const CARD_ANCHOR_OFFSET = 8;
+const DETAIL_CACHE_LIMIT = 300;
+let nearbyCardState = { unitId: null, visible: false, list: [] };
+const detailCache = new Map(); // unitId -> { ts, data }
+let loginOverlayEl = null;
+let loginErrorEl = null;
+let loginLoginInput = null;
+let loginPasswordInput = null;
+let loginSubmitBtn = null;
+let loginInitDone = false;
+let userLabelEl = null;
+let adminBtn = null;
+let logoutBtn = null;
+let adminModal = null;
+let adminUsersEl = null;
+let adminNodesEl = null;
+let adminUnassignedEl = null;
+let adminAssignNodeInput = null;
+let adminAssignUnitsInput = null;
+let adminMsgEl = null;
+let cardLayoutEdit = false;
+let cardDragKey = null;
+let cardPreviewById = new Map();
+let detailPrefetchInFlight = new Set();
+let detailCacheKeys = [];
+
+function getUnitIconUrl(kind) {
+  switch (kind) {
+    case "bus":
+      return "/static/icons/bus.svg";
+    case "van":
+      return "/static/icons/van.svg";
+    case "truck":
+      return "/static/icons/truck.svg";
+    case "tractor":
+      return "/static/icons/tractor.svg";
+    case "combine":
+      return "/static/icons/combine.svg";
+    case "loader":
+      return "/static/icons/loader.svg";
+    case "car":
+    default:
+      return "/static/icons/car.svg";
+  }
+}
+
+function loadCardSettings() {
+  try {
+    const raw = localStorage.getItem(CARD_SETTINGS_KEY);
+    if (!raw) return { ...DEFAULT_CARD_SECTIONS };
+    const parsed = JSON.parse(raw);
+    const clean = {};
+    Object.keys(DEFAULT_CARD_SECTIONS).forEach((k) => {
+      clean[k] = parsed[k] !== undefined ? parsed[k] : DEFAULT_CARD_SECTIONS[k];
+    });
+    return clean;
+  } catch {
+    return { ...DEFAULT_CARD_SECTIONS };
+  }
+}
+
+function saveCardSettings() {
+  localStorage.setItem(CARD_SETTINGS_KEY, JSON.stringify(cardSettings));
+}
+
+function loadCardOrder() {
+  try {
+    const raw = localStorage.getItem(CARD_ORDER_KEY);
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) {
+        const filtered = arr.filter((k) => DEFAULT_CARD_ORDER.includes(k));
+        return filtered.concat(DEFAULT_CARD_ORDER.filter((k) => !filtered.includes(k)));
+      }
+    }
+  } catch {}
+  return [...DEFAULT_CARD_ORDER];
+}
+
+function saveCardOrder(order) {
+  try {
+    localStorage.setItem(CARD_ORDER_KEY, JSON.stringify(order));
+  } catch {}
+}
+
+function buildPreviewDetail(item) {
+  const statusDetails = {
+    online: item.online,
+    status: item.status,
+    status_label: item.status_label,
+    last_ts: item.last_ts,
+    ignition: item.ignition,
+    speed: item.speed,
+  };
+  const paramsObj = item.params || {};
+  const paramsArr = Object.entries(paramsObj).slice(0, 8).map(([key, value]) => ({ key, value }));
+  return {
+    item,
+    latest: {
+      lat: item.lat,
+      lon: item.lon,
+      params: paramsObj,
+      last_ts: item.last_ts,
+    },
+    snapshot: {
+      lat: item.lat,
+      lon: item.lon,
+      meta: item.address ? { address: item.address } : {},
+      device: { hardware: item.hw },
+      uid: item.uid,
+    },
+    status_details: statusDetails,
+    card_data: {
+      status: statusDetails,
+      location: { lat: item.lat, lon: item.lon, address: item.address || "—" },
+      connectivity: { uid: item.uid, hardware: item.hw },
+      params: paramsArr,
+    },
+  };
+}
+
+function cacheDetail(id, data) {
+  const now = Date.now();
+  if (detailCache.has(id)) {
+    detailCache.delete(id);
+    detailCacheKeys = detailCacheKeys.filter((k) => k !== id);
+  }
+  detailCache.set(id, { ts: now, data });
+  detailCacheKeys.push(id);
+  if (detailCacheKeys.length > DETAIL_CACHE_LIMIT) {
+    const oldest = detailCacheKeys.shift();
+    if (oldest !== undefined) {
+      detailCache.delete(oldest);
+    }
+  }
+}
+
+function resetCardSettings() {
+  cardSettings = { ...DEFAULT_CARD_SECTIONS };
+  cardOrder = [...DEFAULT_CARD_ORDER];
+  saveCardSettings();
+  saveCardOrder(cardOrder);
+  persistPanelSettings();
+  renderCardOrderList();
+  if (currentCardDetail) renderCard(currentCardDetail);
+}
+
+function getAllTabs() {
+  if (!panelTabs.length) {
+    panelTabs = [...DEFAULT_TABS];
+  }
+  return panelTabs;
+}
+
+function ensureTabExists(id) {
+  return getAllTabs().some((t) => t.id === id);
+}
+
+function loadActiveTab() {
+  const saved = localStorage.getItem(ACTIVE_TAB_KEY);
+  if (saved && ensureTabExists(saved)) {
+    return saved;
+  }
+  return "work";
+}
+
+function setActiveTab(id) {
+  if (!ensureTabExists(id)) return;
+  activeTabId = id;
+  localStorage.setItem(ACTIVE_TAB_KEY, id);
+  renderTabs();
+  restoreSearchForActiveTab();
+  applyFilters();
+  persistPanelSettings();
+}
+
+function removeTab(id) {
+  if (id === "work") return;
+  panelTabs = panelTabs.filter((t) => t.id !== id);
+  deleteTabState(id);
+  if (activeTabId === id) {
+    activeTabId = panelTabs[0]?.id || "work";
+    localStorage.setItem(ACTIVE_TAB_KEY, activeTabId);
+  }
+  renderTabs();
+  restoreSearchForActiveTab();
+  applyFilters();
+  persistPanelSettings();
+}
+
+function getActiveTab() {
+  const tabs = getAllTabs();
+  return tabs.find((t) => t.id === activeTabId) || tabs[0];
+}
+
+async function fetchPanelSettings() {
+  try {
+    const res = await authFetch("/web/api/settings/panel");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (data.card_sections) {
+      const merged = { ...DEFAULT_CARD_SECTIONS, ...data.card_sections };
+      cardSettings = {};
+      Object.keys(DEFAULT_CARD_SECTIONS).forEach((k) => {
+        cardSettings[k] = merged[k] !== undefined ? merged[k] : DEFAULT_CARD_SECTIONS[k];
+      });
+      saveCardSettings();
+    }
+    if (Array.isArray(data.tabs)) {
+      panelTabs = ensureWorkTabList(data.tabs);
+    }
+    if (data.active_tab_id) {
+      activeTabId = data.active_tab_id;
+      localStorage.setItem(ACTIVE_TAB_KEY, activeTabId);
+    }
+  } catch (err) {
+    console.warn("panel settings fetch failed", err);
+  } finally {
+    panelSettingsReady = true;
+    panelTabs = ensureWorkTabList(panelTabs);
+    if (!ensureTabExists(activeTabId)) {
+      activeTabId = panelTabs[0]?.id || "work";
+      localStorage.setItem(ACTIVE_TAB_KEY, activeTabId);
+    }
+  }
+}
+
+async function persistPanelSettings() {
+  if (!panelSettingsReady) return;
+  const payload = {
+    tabs: panelTabs,
+    active_tab_id: activeTabId,
+    card_sections: cardSettings,
+  };
+  try {
+    await authFetch("/web/api/settings/panel", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    console.warn("panel settings save failed", err);
+  }
+}
+
+async function ensureSession() {
+  const cached = localStorage.getItem(SESSION_KEY);
+  if (cached) return cached;
+  // Всегда используем WEB‑логин (токен из бота больше не нужен).
+  const sid = await ensureLoginSession();
+  return sid;
+}
+
+async function authFetch(url, opts = {}) {
+  const sid = await ensureSession();
+  const headers = { ...(opts.headers || {}), "X-Session-Id": sid };
+  return fetch(url, { ...opts, headers });
+}
+
+function logClientEvent(event, detail = {}) {
+  authFetch("/web/api/logs/client", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ event, detail }),
+  }).catch(() => {});
+}
+
+function setStatus(text) {
+  const el = document.getElementById("status");
+  if (el) el.textContent = text;
+}
+
+function initLoginModal() {
+  if (loginInitDone) return;
+  loginInitDone = true;
+  loginOverlayEl = document.getElementById("login-overlay");
+  loginErrorEl = document.getElementById("login-error");
+  loginLoginInput = document.getElementById("login-login");
+  loginPasswordInput = document.getElementById("login-password");
+  loginSubmitBtn = document.getElementById("login-submit");
+  if (!loginOverlayEl || !loginLoginInput || !loginPasswordInput || !loginSubmitBtn) {
+    return;
+  }
+  const submitHandler = async () => {
+    const login = loginLoginInput.value.trim();
+    const password = loginPasswordInput.value;
+    if (!login || !password) {
+      showLoginError("Укажите логин и пароль");
+      return;
+    }
+    loginSubmitBtn.disabled = true;
+    showLoginError("");
+    try {
+      const res = await fetch("/web/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ login, password }),
+      });
+      if (!res.ok) {
+        if (res.status === 401) {
+          showLoginError("Неверный логин или пароль");
+        } else {
+          showLoginError("Ошибка входа, попробуйте позже");
+        }
+        return;
+      }
+      const data = await res.json();
+      if (data.session_id) {
+        localStorage.setItem(SESSION_KEY, data.session_id);
+        try {
+          localStorage.setItem(SESSION_INFO_KEY, JSON.stringify(data));
+        } catch {}
+        hideLoginModal();
+      } else {
+        showLoginError("Неверный ответ сервера");
+      }
+    } catch (err) {
+      console.error("login error", err);
+      showLoginError("Ошибка сети при входе");
+    } finally {
+      loginSubmitBtn.disabled = false;
+    }
+  };
+  loginSubmitBtn.addEventListener("click", submitHandler);
+  [loginLoginInput, loginPasswordInput].forEach((el) => {
+    el.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        submitHandler();
+      }
+    });
+  });
+}
+
+function showLoginError(msg) {
+  if (!loginErrorEl) return;
+  if (!msg) {
+    loginErrorEl.style.display = "none";
+    loginErrorEl.textContent = "";
+  } else {
+    loginErrorEl.textContent = msg;
+    loginErrorEl.style.display = "block";
+  }
+}
+
+function showLoginModal() {
+  initLoginModal();
+  if (!loginOverlayEl) return;
+  loginOverlayEl.classList.remove("hidden");
+  showLoginError("");
+  if (loginLoginInput) {
+    loginLoginInput.focus();
+  }
+}
+
+function hideLoginModal() {
+  if (!loginOverlayEl) return;
+  loginOverlayEl.classList.add("hidden");
+}
+
+async function ensureLoginSession() {
+  const existing = localStorage.getItem(SESSION_KEY);
+  if (existing) return existing;
+  return new Promise((resolve, reject) => {
+    showLoginModal();
+    const start = Date.now();
+    const tick = () => {
+      const sid = localStorage.getItem(SESSION_KEY);
+      if (sid) {
+        resolve(sid);
+        return;
+      }
+      if (Date.now() - start > 10 * 60 * 1000) {
+        reject(new Error("login timeout"));
+        return;
+      }
+      setTimeout(tick, 300);
+    };
+    tick();
+  });
+}
+
+async function fetchSessionInfo() {
+  try {
+    const res = await authFetch("/web/api/session");
+    if (res.status === 401) {
+      // сессия протухла или отсутствует — чистим и показываем логин
+      localStorage.removeItem(SESSION_KEY);
+      localStorage.removeItem(SESSION_INFO_KEY);
+      showLoginModal();
+      return;
+    }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    localStorage.setItem(SESSION_INFO_KEY, JSON.stringify(data));
+    applySessionInfo(data);
+  } catch (e) {
+    console.warn("session info load failed", e);
+  }
+}
+
+function applySessionInfo(info) {
+  if (!info) {
+    userLabelEl && (userLabelEl.textContent = "—");
+    if (adminBtn) adminBtn.style.display = "none";
+    return;
+  }
+  if (userLabelEl) {
+    const name = info.display_name || info.login || "—";
+    userLabelEl.textContent = `${name}${info.is_admin ? " (admin)" : ""}`;
+  }
+  if (adminBtn) {
+    adminBtn.style.display = info.is_admin ? "inline-flex" : "none";
+  }
+}
+
+async function logout() {
+  const sid = localStorage.getItem(SESSION_KEY);
+  localStorage.removeItem(SESSION_KEY);
+  localStorage.removeItem(SESSION_INFO_KEY);
+  try {
+    if (sid) {
+      await fetch("/web/api/logout", { method: "POST", headers: { "X-Session-Id": sid } });
+    }
+  } catch (_) {}
+  window.location.reload();
+}
+
+async function openAdmin() {
+  if (!adminModal) return;
+  try {
+    const res = await authFetch("/web/api/admin/summary");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    adminUsersEl.textContent = (data.users || [])
+      .map((u) => `${u.id}: ${u.login} (${u.display_name}) admin=${u.is_admin} node=${u.node_id ?? "-"}`)
+      .join("\n");
+    adminNodesEl.textContent = (data.nodes || [])
+      .map((n) => `${n.id}: ${n.name} parent=${n.parent_id ?? "-"} order=${n.order}`)
+      .join("\n");
+    adminUnassignedEl.textContent = (data.unassigned_units || []).join(", ") || "—";
+    adminMsgEl.textContent = "";
+    adminModal.classList.remove("hidden");
+  } catch (e) {
+    console.error("admin summary", e);
+    showToast("Не удалось загрузить админку");
+  }
+}
+
+async function assignOwners() {
+  const nodeId = Number(adminAssignNodeInput.value);
+  if (!Number.isFinite(nodeId)) {
+    adminMsgEl.textContent = "Укажите node_id";
+    return;
+  }
+  const ids = (adminAssignUnitsInput.value || "")
+    .split(",")
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n));
+  if (!ids.length) {
+    adminMsgEl.textContent = "Укажите unit ids";
+    return;
+  }
+  try {
+    const res = await authFetch("/web/api/admin/units_meta", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ unit_ids: ids, node_id: nodeId }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    adminMsgEl.textContent = "Назначено";
+    await openAdmin();
+    await loadUnits({ restartLive: true });
+  } catch (e) {
+    adminMsgEl.textContent = "Ошибка назначения";
+  }
+}
+
+async function loadUnits({ restartLive = false } = {}) {
+  const res = await authFetch("/web/api/units");
+  if (!res.ok) throw new Error("units http " + res.status);
+  units = await res.json();
+  // сохраним превью, если сервер прислал
+  cardPreviewById.clear();
+  units.forEach((u) => {
+    if (u.card_preview) {
+      cardPreviewById.set(u.id, u.card_preview);
+      delete u.card_preview;
+    }
+  });
+  rebuildUnitIndex();
+  sortUnits();
+  applyFilters();
+  if (restartLive) {
+    feedSince = null;
+    scheduleLiveUpdates(true);
+  }
+}
+
+async function loadWorklist() {
+  try {
+    const res = await authFetch("/web/api/worklist");
+    if (!res.ok) return;
+    worklist = new Set(await res.json());
+    applyFilters();
+  } catch (e) {
+    console.warn("worklist load failed", e);
+  }
+}
+
+function applyFilters() {
+  const searchInput = document.getElementById("search");
+  const rawSearch = (searchInput?.value || "").trim();
+  const searchById = !!document.getElementById("search-by-id")?.checked;
+  const tokens = rawSearch
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (activeTabId) {
+    setTabState(activeTabId, { search: rawSearch });
+  }
+  const view = getActiveTab();
+  let list = units;
+  if (view.filters?.worklist) {
+    // Если рабочий список пустой — показываем все доступные юниты, чтобы не было «пустого экрана».
+    if (worklist.size) {
+      list = list.filter((u) => worklist.has(u.id));
+    }
+  }
+  if (view.filters?.online && !view.filters?.offline) {
+    list = list.filter((u) => u.online);
+  } else if (view.filters?.offline && !view.filters?.online) {
+    list = list.filter((u) => !u.online);
+  }
+  if (view.filters?.hasFuel) {
+    list = list.filter((u) => u.has_fuel);
+  }
+  if (view.filters?.regions && view.filters.regions.length) {
+    list = list.filter((u) => {
+      if (!u.region) return false;
+      const region = u.region.toLowerCase();
+      return view.filters.regions.some((r) => region.includes(r));
+    });
+  }
+  const sensorQuery = (view.filters?.sensorQuery || "").trim().toLowerCase();
+  if (sensorQuery) {
+    const tokens = sensorQuery.split(/\s+/).filter(Boolean);
+    if (tokens.length) {
+      list = list.filter((u) => {
+        const tags = Array.isArray(u.sensor_tags) ? u.sensor_tags.map((tag) => String(tag).toLowerCase()) : [];
+        if (!tags.length) return false;
+        return tokens.every((token) => tags.some((tag) => tag.includes(token)));
+      });
+    }
+  }
+  if (tokens.length) {
+    list = list.filter((u) => {
+      const baseHaystacks = [u.name, u.reg_number, u.hw, u.address]
+        .filter(Boolean)
+        .map((s) => String(s).toLowerCase());
+      const uidHaystacks = searchById ? [u.uid] : []; // UID учитываем только когда включён ID‑режим, чтобы не ловить ID при совпадении чисел
+      const idHaystacks = searchById && u.id ? [String(u.id)] : [];
+      const haystacks = [...baseHaystacks, ...uidHaystacks.map((s) => String(s).toLowerCase()), ...idHaystacks];
+      return tokens.every((t) => haystacks.some((h) => h.includes(t)));
+    });
+  }
+  // Quick filters
+  if (quickFilters.online && !quickFilters.offline) {
+    list = list.filter((u) => u.online);
+  } else if (quickFilters.offline && !quickFilters.online) {
+    list = list.filter((u) => !u.online);
+  }
+  if (quickFilters.moving) {
+    list = list.filter((u) => u.status === "moving");
+  }
+  if (quickFilters.stop) {
+    // Остановка: короткое прекращение движения (park_ign_on/off)
+    list = list.filter((u) => u.status === "park_ign_on" || u.status === "park_ign_off");
+  }
+  if (quickFilters.parking) {
+    // Стоянка: длительное, двигатель выключен (stop/stopped)
+    list = list.filter((u) => u.status === "stop" || u.status === "stopped");
+  }
+  if (quickFilters.ign_on) {
+    list = list.filter((u) => u.ignition === true);
+  }
+  current = list;
+  // Always keep выбранный юнит видимым, чтобы карточка не схлопывалась при обновлениях/фильтрах.
+  if (selectedId) {
+    const selectedUnit = unitsById.get(selectedId);
+    if (selectedUnit && !current.some((u) => u.id === selectedId)) {
+      current = [selectedUnit, ...current];
+    }
+  }
+  let shouldRenderList = true;
+  if (selectedId) {
+    const exists = current.some((u) => u.id === selectedId);
+    if (!exists) {
+      // юнит отсутствует в глобальном списке (удалён) — закрываем карточку
+      hideCard();
+      shouldRenderList = false;
+    }
+  }
+  if (shouldRenderList) {
+    renderList();
+  }
+  syncMarkers(current);
+  updateFooterStatus();
+}
+
+function getWatchIds() {
+  const ids = [];
+  if (selectedId) ids.push(selectedId);
+  const viewport = listEl?.clientHeight || 600;
+  const rawScrollTop = listEl?.scrollTop || 0;
+  const scrollTop = adjustScrollTop(rawScrollTop);
+  const start = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN);
+  const end = Math.min(current.length, start + Math.ceil(viewport / ROW_H) + OVERSCAN * 2);
+  for (let i = start; i < end; i++) {
+    const id = current[i]?.id;
+    if (id) ids.push(id);
+  }
+  worklist.forEach((id) => ids.push(id));
+  return Array.from(new Set(ids));
+}
+
+function updateFooterStatus() {
+  const total = units.length;
+  const online = units.filter((u) => u.online).length;
+  const fuel = units.filter((u) => u.has_fuel).length;
+  const active = getActiveTab();
+  setStatus(`Онлайн: ${online}/${total} • Вкладка: ${active.name}`);
+}
+
+function ensureListDom() {
+  if (listEl) return;
+  listEl = document.getElementById("unit-list");
+  if (!listEl) {
+    console.error("unit-list element not found");
+    return;
+  }
+  innerEl = document.createElement("div");
+  innerEl.className = "unit-list-inner";
+  listEl.appendChild(innerEl);
+  if (cardEl && !innerEl.contains(cardEl)) {
+    innerEl.appendChild(cardEl);
+  }
+  listEl.addEventListener("scroll", () => requestAnimationFrame(renderList));
+  const searchInput = document.getElementById("search");
+  if (searchInput) searchInput.addEventListener("input", applyFilters);
+  const searchByIdToggle = document.getElementById("search-by-id");
+  if (searchByIdToggle) searchByIdToggle.addEventListener("change", applyFilters);
+  document.querySelectorAll(".icon-btn[data-filter]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.filter;
+      if (!key) return;
+      quickFilters[key] = !quickFilters[key];
+      btn.classList.toggle("active", quickFilters[key]);
+      // online/offline mutually exclusive
+      if (key === "online" && quickFilters.online && quickFilters.offline) {
+        quickFilters.offline = false;
+        document.querySelector('.icon-btn[data-filter="offline"]').classList.remove("active");
+      }
+      if (key === "offline" && quickFilters.offline && quickFilters.online) {
+        quickFilters.online = false;
+        document.querySelector('.icon-btn[data-filter="online"]').classList.remove("active");
+      }
+      applyFilters();
+    });
+  });
+  const refreshBtn = document.getElementById("btn-refresh");
+  if (refreshBtn) {
+    refreshBtn.addEventListener("click", () => {
+      loadUnits({ restartLive: true }).catch((e) => console.error(e));
+    });
+  }
+  const btnAdd = document.getElementById("btn-add");
+  if (btnAdd) btnAdd.addEventListener("click", openModal);
+}
+
+function ensurePool() {
+  const viewport = listEl.clientHeight || 600;
+  const desired = Math.min(MAX_POOL, Math.max(MIN_POOL, Math.ceil(viewport / ROW_H) + OVERSCAN * 2));
+  if (poolSize === desired) return;
+  poolSize = desired;
+  const cardNode = cardEl && innerEl.contains(cardEl) ? cardEl : null;
+  innerEl.innerHTML = "";
+  pool = [];
+  for (let i = 0; i < desired; i++) {
+    const row = document.createElement("div");
+    row.className = "unit-row";
+    const name = document.createElement("div");
+    name.className = "unit-name";
+     const nameIcon = document.createElement("img");
+     nameIcon.className = "unit-type-icon";
+     const nameSpan = document.createElement("span");
+     nameSpan.className = "unit-title";
+     name.appendChild(nameIcon);
+     name.appendChild(nameSpan);
+    const meta = document.createElement("div");
+    meta.className = "unit-meta";
+    const speed = document.createElement("div");
+    speed.className = "unit-meta";
+    const star = document.createElement("div");
+    star.className = "unit-meta";
+    row.appendChild(name);
+    row.appendChild(speed);
+    row.appendChild(star);
+    row._name = nameSpan;
+    row._icon = nameIcon;
+    row._meta = meta;
+    row._speed = speed;
+    row._star = star;
+    row.appendChild(meta);
+    pool.push(row);
+    innerEl.appendChild(row);
+    row.addEventListener("click", () => selectUnit(row._id));
+  }
+  if (cardNode) {
+    innerEl.appendChild(cardNode);
+  }
+}
+
+function renderTabs() {
+  const container = document.getElementById("view-tabs");
+  if (!container) return;
+  const tabs = getAllTabs();
+  container.innerHTML = "";
+  tabs.forEach((tab) => {
+    const btn = document.createElement("button");
+    btn.className = `tab-btn${tab.id === activeTabId ? " active" : ""}`;
+    btn.dataset.id = tab.id;
+    btn.textContent = tab.name;
+    btn.addEventListener("click", () => setActiveTab(tab.id));
+    if (tab.id !== "work") {
+      const close = document.createElement("button");
+      close.className = "tab-close";
+      close.textContent = "×";
+      close.title = "Удалить вкладку";
+      close.addEventListener("click", (e) => {
+        e.stopPropagation();
+        removeTab(tab.id);
+      });
+      btn.appendChild(close);
+    }
+    container.appendChild(btn);
+  });
+}
+
+function openTabModal() {
+  const modal = document.getElementById("tab-modal");
+  document.getElementById("tab-name").value = "";
+  document.getElementById("tab-worklist").checked = false;
+  document.getElementById("tab-online").checked = false;
+  document.getElementById("tab-offline").checked = false;
+  document.getElementById("tab-has-fuel").checked = false;
+  document.getElementById("tab-regions").value = "";
+  tabFilterRows = [{ kind: "sensor", value: "" }];
+  renderTabFilterRows();
+  modal.classList.remove("hidden");
+}
+
+function closeTabModal() {
+  document.getElementById("tab-modal").classList.add("hidden");
+}
+
+function saveTabFromModal() {
+  const name = document.getElementById("tab-name").value.trim();
+  if (!name) {
+    alert("Укажите название вкладки");
+    return;
+  }
+  const filters = {
+    worklist: document.getElementById("tab-worklist").checked,
+    online: document.getElementById("tab-online").checked,
+    offline: document.getElementById("tab-offline").checked,
+    hasFuel: document.getElementById("tab-has-fuel").checked,
+    regions: document
+      .getElementById("tab-regions")
+      .value.split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  };
+  const advanced = buildFiltersFromRows(tabFilterRows);
+  Object.assign(filters, advanced);
+  const tab = {
+    id: `tab-${Date.now().toString(36)}`,
+    name,
+    filters,
+  };
+  panelTabs = [...panelTabs, tab];
+  closeTabModal();
+  setActiveTab(tab.id);
+  persistPanelSettings();
+}
+
+function buildMetaText(unit) {
+  const segments = [];
+  if (unit.hw) segments.push(unit.hw);
+  if (unit.status_label) {
+    segments.push(stripIgnitionText(unit.status_label));
+  }
+  if (!unit.online) {
+    if (unit.offline_reason) {
+      segments.push(unit.offline_reason);
+    } else if (unit.last_ts) {
+      segments.push(`нет данных ${formatRelativeTime(unit.last_ts)}`);
+    }
+  } else {
+    const chip = buildStatusChip(unit);
+    if (chip) segments.push(chip);
+  }
+  if (!segments.length) {
+    segments.push("—");
+  }
+  return segments.join(" · ");
+}
+
+function buildStatusChip(unit) {
+  const status = unit.status;
+  const ign = unit.ignition;
+  if (status === "moving") return "🚗 движение";
+  if (status === "stop" || status === "stopped") return '<span class="parking-chip">🅿️ стоянка</span>';
+  if (status === "park_ign_on" || status === "park_ign_off") return "🛑 остановка";
+  if (ign === true) return "🔑 зажиг. вкл";
+  // выключенное зажигание не показываем чипом
+  return "";
+}
+
+function updateRow(node, unit, idx, translateY) {
+  node._id = unit.id;
+  node.dataset.id = String(unit.id);
+  node.dataset.index = String(idx);
+  node.style.transform = `translateY(${translateY}px)`;
+  node.classList.toggle("is-selected", unit.id === selectedId);
+  const iconUrl = getUnitIconUrl(unit.icon_kind);
+  if (node._icon) {
+    if (iconUrl) {
+      node._icon.src = iconUrl;
+      node._icon.style.display = "";
+    } else {
+      node._icon.style.display = "none";
+    }
+  }
+  node._name.textContent = unit.name;
+  const ign = unit.ignition;
+  const ignHtml = ign === true ? `<span class="ign-chip">🔑 вкл</span>` : "";
+  node._meta.innerHTML = `<span class="dot ${unit.online ? "online" : "offline"}"></span>${buildMetaText(unit)} ${ignHtml}`;
+  node._speed.textContent = unit.speed != null ? `${Math.round(unit.speed)} км/ч` : "";
+  node._star.textContent = worklist.has(unit.id) ? "★" : "☆";
+  node.onmouseenter = (e) => {
+    showTooltip(unit, e.clientX, e.clientY);
+    // лёгкий prefetch деталей, чтобы клик был мгновенным
+    if (node._prefetchTimer) clearTimeout(node._prefetchTimer);
+    node._prefetchTimer = setTimeout(() => prefetchDetail(unit.id), 180);
+  };
+  node.onmousemove = (e) => showTooltip(unit, e.clientX, e.clientY);
+  node.onmouseleave = hideTooltip;
+}
+
+async function prefetchDetail(id) {
+  const cached = detailCache.get(id);
+  const now = Date.now();
+  if (cached && now - cached.ts < DETAIL_CACHE_TTL_MS) return;
+  if (detailPrefetchInFlight.has(id)) return;
+  if (detailPrefetchInFlight.size >= 3) return;
+  detailPrefetchInFlight.add(id);
+  try {
+    const res = await authFetch(`/web/api/units/${id}`);
+    if (!res.ok) throw new Error(`prefetch http ${res.status}`);
+    const data = await res.json();
+    cacheDetail(id, data);
+  } catch (err) {
+    console.warn("prefetch failed", err);
+  } finally {
+    detailPrefetchInFlight.delete(id);
+  }
+}
+
+function renderList() {
+  ensureListDom();
+  ensurePool();
+  const total = current.length;
+  const viewport = listEl.clientHeight || 600;
+  const rawScrollTop = listEl.scrollTop || 0;
+  const scrollTop = adjustScrollTop(rawScrollTop);
+  const start = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN);
+  const end = Math.min(total, start + Math.ceil(viewport / ROW_H) + OVERSCAN * 2);
+  const extraHeight = cardVisible ? cardHeight : 0;
+  innerEl.style.height = `${total * ROW_H + extraHeight}px`;
+  const visible = end - start;
+  for (let i = 0; i < pool.length; i++) {
+    if (i < visible) {
+      const u = current[start + i];
+      const idx = start + i;
+      let translateY = idx * ROW_H;
+      if (cardVisible && expandedIndex !== null && idx > expandedIndex) {
+        translateY += cardHeight;
+      }
+      updateRow(pool[i], u, idx, translateY);
+      pool[i].style.display = "grid";
+    } else {
+      pool[i].style.display = "none";
+    }
+  }
+  updateCardPlacement();
+}
+
+async function selectUnit(id) {
+  // toggle: if already opened on this unit, close fast
+  if (cardVisible && currentCardDetail?.item?.id === id) {
+    hideCard();
+    return;
+  }
+  const t0 = performance.now ? performance.now() : Date.now();
+  selectedId = id;
+  logClientEvent("card_select", { unitId: id });
+  hideTooltip();
+  const listItem = unitsById.get(id);
+  if (listItem) {
+    const preview = cardPreviewById.get(id) || buildPreviewDetail(listItem);
+    currentCardDetail = preview;
+    resetNearbyState(listItem.id);
+    renderCard(preview);
+  }
+  try {
+    const cached = detailCache.get(id);
+    const now = Date.now();
+    let data;
+    let fetchMs = 0;
+    let fromCache = false;
+    if (cached && now - cached.ts < DETAIL_CACHE_TTL_MS) {
+      fromCache = true;
+      data = cached.data;
+    } else {
+      const tf0 = performance.now ? performance.now() : Date.now();
+      const res = await authFetch(`/web/api/units/${id}`);
+      if (!res.ok) throw new Error("detail http " + res.status);
+      data = await res.json();
+      cacheDetail(id, data);
+      const tf1 = performance.now ? performance.now() : Date.now();
+      fetchMs = tf1 - tf0;
+    }
+    const tr0 = performance.now ? performance.now() : Date.now();
+    currentCardDetail = data;
+    resetNearbyState(data.item.id);
+    renderCard(data);
+    focusMarker(data.item);
+    const tr1 = performance.now ? performance.now() : Date.now();
+    const totalMs = tr1 - t0;
+    logClientEvent("card_perf", {
+      unitId: id,
+      fromCache,
+      fetchMs,
+      renderMs: tr1 - tr0,
+      totalMs,
+      cacheAgeMs: fromCache ? now - (cached?.ts || now) : null,
+    });
+    console.debug("card_perf", { unitId: id, fromCache, fetchMs, renderMs: tr1 - tr0, totalMs });
+    logClientEvent("card_detail_loaded", {
+      unitId: id,
+      hasCard: !!data.card_data,
+      hasConfig: !!data.unit_config,
+    });
+  } catch (e) {
+    console.error(e);
+    const t1 = performance.now ? performance.now() : Date.now();
+    logClientEvent("card_perf", {
+      unitId: id,
+      error: e?.message || String(e),
+      totalMs: t1 - t0,
+    });
+    logClientEvent("card_detail_failed", { unitId: id, message: e?.message || String(e) });
+  }
+}
+
+
+function renderCard(detail) {
+  if (!cardEl) return;
+  try {
+    const { item } = detail;
+    if (nearbyCardState.unitId !== item.id) {
+      resetNearbyState(item.id);
+    }
+    const showNearby = nearbyCardState.visible && nearbyCardState.unitId === item.id;
+    const nearbyList = showNearby ? nearbyCardState.list : [];
+    const cardData = detail.card_data || {};
+    const fallbackLatest = detail.latest || {};
+    const fallbackSnapshot = detail.snapshot || {};
+    const fallbackStatus = detail.status_details || {};
+    const sectionBlocks = [];
+    const statusBlock = cardData.status || {
+      online: item.online,
+      status_label: item.status_label,
+      last_ts: fallbackStatus.last_ts,
+      speed: fallbackLatest.speed,
+      ignition: fallbackStatus.ignition,
+      moving: (() => {
+        const s = cardData.status?.speed ?? fallbackLatest.speed;
+        if (s != null && !Number.isNaN(Number(s))) return Number(s) > 1;
+        return fallbackStatus.status === "moving";
+      })(),
+      status: cardData.status?.status || fallbackStatus.status,
+    };
+    const statusChips = [];
+    if (statusBlock.status === "moving" || statusBlock.moving) statusChips.push("🚗 Движение");
+    else if (statusBlock.status === "stop") statusChips.push("🅿️ Стоянка");
+    else if (statusBlock.status === "park_ign_on") statusChips.push("🛑 Остановка");
+    else if (statusBlock.status === "park_ign_off") statusChips.push("🛑 Остановка");
+    else if (statusBlock.online) statusChips.push("🛑 Остановка");
+    if (statusBlock.ignition === true) {
+      // ключ только для включённого зажигания
+      statusChips.push("🔑 вкл");
+    }
+
+    // Убираем дублирующее упоминание зажигания в строке статуса, раз уже есть чип.
+    let statusLabelClean = statusBlock.status_label || "";
+    statusLabelClean = stripIgnitionText(statusLabelClean);
+    if (statusLabelClean.endsWith("—")) statusLabelClean = statusLabelClean.slice(0, -1).trim();
+
+    const locationBlock = cardData.location || {};
+    const address = locationBlock.address || (fallbackSnapshot.meta && (fallbackSnapshot.meta.address || fallbackSnapshot.meta.addr)) || "—";
+    const coords = `${formatCoord(locationBlock.lat ?? item.lat)}, ${formatCoord(locationBlock.lon ?? item.lon)}`;
+    const geofences = Array.isArray(locationBlock.geofences) ? locationBlock.geofences : [];
+    const geofenceHtml = geofences.length ? `<div class="geofence-list">${geofences.map((name) => `<span class="geofence-chip">${name}</span>`).join("")}</div>` : "";
+    sectionBlocks.push({
+      key: "location",
+      title: "Местоположение",
+      body: `
+        <div>${address}</div>
+        <div class="location-line">${coords}
+              <button class="ghost icon" data-action="copy-coords" aria-label="Скопировать координаты">📋</button>
+              <button class="ghost icon" data-action="open-map" aria-label="Открыть на карте">🧭</button>
+            </div>
+            ${geofenceHtml}
+        `,
+    });
+
+    const showBlock = (key) => cardLayoutEdit || cardSettings[key];
+
+    if (showBlock("sensors")) {
+      const fallbackSensors = detail.unit_config?.sensors || fallbackSnapshot.sensors || [];
+      const block = cardData.sensors && cardData.sensors.length ? cardData.sensors : fallbackSensors.slice(0, 6);
+      const sensorsKv = block.map((s) => {
+        const label = s.name || s.type || "датчик";
+        const value = s.value != null ? `${s.value}${s.units ? ` ${s.units}` : ""}` : "—";
+        let tone;
+        if (s.state === "alarm" || s.alarm) tone = "danger";
+        else if (s.state === "warn") tone = "warn";
+        return { label, value, tone };
+      });
+      const sensorsHtml = renderKvGrid(sensorsKv);
+      sectionBlocks.push({
+        key: "sensors",
+        title: "Датчики",
+        body: sensorsHtml,
+      });
+    }
+
+    if (showBlock("connectivity")) {
+      const block = cardData.connectivity || {};
+      sectionBlocks.push({
+        key: "connectivity",
+        title: "Подключение",
+        body: `
+          <div>UID: ${block.uid || item.uid || "—"}</div>
+          <div>Устройство: ${block.hardware || item.hw || "—"}</div>
+          ${block.firmware ? `<div>Прошивка: ${block.firmware}</div>` : ""}
+          ${block.phones?.length ? `<div>Телефоны: ${block.phones.join(", ")}</div>` : ""}
+        `,
+      });
+    }
+
+    if (showBlock("counters")) {
+      const block = cardData.counters || {};
+      sectionBlocks.push({
+        key: "counters",
+        title: "Счётчики",
+        body: `
+          <div>Пробег: ${block.mileage != null ? block.mileage : "—"}</div>
+          <div>Моточасы: ${block.engine_hours != null ? block.engine_hours : "—"}</div>
+        `,
+      });
+    }
+
+    if (showBlock("params")) {
+      const shouldShowParam = (key) => {
+        const k = String(key || "").toLowerCase();
+        if (k.startsWith("raw_")) return false;
+        if (k.startsWith("unknown_")) return false;
+        if (k.startsWith("crc_")) return false;
+        if (k.startsWith("packet_")) return false;
+        return true;
+      };
+      const paramsSource =
+        cardData.params && cardData.params.length
+          ? cardData.params
+          : Object.entries(fallbackLatest.params || {}).map(([k, v]) => ({ key: k, value: v }));
+      const params = paramsSource.filter((p) => shouldShowParam(p.key));
+      const paramsKv = params.slice(0, 40).map((p) => ({ label: p.key, value: p.value }));
+      const html = renderKvGrid(paramsKv, { compact: true });
+      sectionBlocks.push({
+        key: "params",
+        title: "Параметры",
+        body: `<div>${html}</div>`,
+      });
+    }
+
+    if (showBlock("recent_events")) {
+      const rows = cardData.recent_events
+        ?.map((e) => {
+          const ts = e.device_ts ? new Date(e.device_ts * 1000).toLocaleString() : "—";
+          const addr = e.params?.address || "";
+          const speed = e.speed != null ? `${Math.round(e.speed)} км/ч` : "";
+          return `<div class="recent-row"><div>${ts}</div><div>${speed}</div><div>${addr}</div></div>`;
+        })
+        .join("");
+      sectionBlocks.push({
+        key: "recent_events",
+        title: "Последние сообщения",
+        body: rows || "—",
+      });
+    }
+
+    if (showBlock("custom_fields")) {
+      const fields = cardData.custom_fields || [];
+      const rows = fields.length ? renderKvGrid(fields.map((f) => ({ label: f.key, value: f.value })), { compact: true }) : "";
+      sectionBlocks.push({
+        key: "custom_fields",
+        title: "Пользовательские поля",
+        body: rows || "—",
+      });
+    }
+
+    if (showBlock("crew")) {
+      const drivers = Array.isArray(cardData.drivers) ? cardData.drivers : [];
+      const trailers = Array.isArray(cardData.trailers) ? cardData.trailers : [];
+      const rows = [];
+      if (drivers.length) {
+        rows.push(
+          ...drivers.map((d) => `<div>${d.name || "Водитель"}${d.phone ? ` (${d.phone})` : ""}</div>`)
+        );
+      }
+      if (trailers.length) {
+        rows.push(...trailers.map((t) => `<div>${t.name || "Прицеп"}</div>`));
+      }
+      sectionBlocks.push({
+        key: "crew",
+        title: "Экипаж и прицепы",
+        body: rows.length ? rows.join("") : "—",
+      });
+    }
+
+    const offlineLine = item.offline_reason ? `<span class="card-status-pill">${item.offline_reason}</span>` : "";
+    if (showNearby || cardLayoutEdit) {
+      const rows =
+        showNearby && nearbyList && nearbyList.length
+          ? nearbyList
+              .map(
+                (entry) => `
+            <button class="nearby-row" data-action="card-select" data-unit-id="${entry.id}">
+              <span>${entry.name}</span>
+              <span class="muted">${entry.distance}</span>
+            </button>`
+              )
+              .join("")
+          : `<div class="muted">Нажмите компас, чтобы показать ближайшие объекты</div>`;
+      sectionBlocks.unshift({
+        key: "nearby",
+        title: "Ближайшие",
+        body: `<div class="card-nearby-list">${rows}</div>`,
+      });
+    }
+
+    const statusLabel = statusBlock.status_label || "Нет связи";
+    const lastTs = statusBlock.last_ts ?? fallbackStatus.last_ts ?? fallbackLatest.last_ts;
+    const statusCaption = `Последнее сообщение: ${formatRelativeTime(lastTs)}`;
+    const statusDotClass = item.online ? "online" : "offline";
+    const statusRow = `
+      <div class="card-status-row">
+        <span class="card-status-dot ${statusDotClass}"></span>
+        <div class="card-status-body">
+          <div class="card-status-title">${item.online ? "Онлайн" : "Оффлайн"} — ${statusLabel}</div>
+          <div class="card-status-caption">${statusCaption}</div>
+        </div>
+        ${offlineLine}
+      </div>
+    `;
+    cardEl.dataset.unitId = String(item.id);
+    currentCardDetail = detail;
+    const idx = current.findIndex((u) => u.id === item.id);
+    if (idx === -1) {
+      hideCard();
+      return;
+    }
+    selectedId = item.id;
+    expandedIndex = idx;
+    cardVisible = true;
+    cardEl.classList.remove("hidden");
+    const order = loadCardOrder();
+    const orderIndex = (k) => {
+      const v = order.indexOf(k);
+      return v === -1 ? 999 : v;
+    };
+    const sortedBlocks = sectionBlocks
+      .filter((b) => cardLayoutEdit || cardSettings[b.key] || FIXED_CARD_KEYS.includes(b.key))
+      .sort((a, b) => orderIndex(a.key) - orderIndex(b.key));
+
+    const buildSectionHtml = (block) => {
+      const editable = cardLayoutEdit && !FIXED_CARD_KEYS.includes(block.key);
+      const hidden = !cardSettings[block.key];
+      const handle = editable ? `<span class="section-handle" data-section-key="${block.key}">☰</span>` : "";
+      const toggleBtn = editable
+        ? `<button class="ghost icon section-toggle" data-action="card-section-toggle" data-section-key="${block.key}" title="${hidden ? "Показать" : "Скрыть"}">${hidden ? "🚫" : "👁"}</button>`
+        : "";
+      const body = cardLayoutEdit ? "" : block.body;
+      return `
+      <section class="card-block${cardLayoutEdit ? " card-block-edit" : ""}" data-section-key="${block.key}" ${editable ? 'draggable="true"' : ""}>
+        <div class="card-block-header">
+          <div class="card-block-title">
+            ${handle}
+            <span class="label">${block.title || cardSectionTitle(block.key)}</span>
+          </div>
+          ${toggleBtn}
+        </div>
+        <div class="card-block-body">${body}</div>
+      </section>`;
+    };
+    cardEl.innerHTML = `
+    <div class="card-head">
+      <div class="card-head-main">
+        <div class="card-head-name">${item.name || "Объект"}</div>
+      </div>
+      <div class="card-actions">
+        ${cardLayoutEdit ? `<button class="ghost icon" data-action="card-layout-reset" title="Сбросить по умолчанию">↺</button>` : ""}
+        <button class="ghost icon${cardLayoutEdit ? " edit-active" : ""}" data-action="card-layout-toggle" title="Настроить карточку">☰</button>
+        <button class="ghost icon" data-action="card-nearby" title="Ближайшие объекты">${showNearby ? "🧭−" : "🧭"}</button>
+      </div>
+    </div>
+    ${statusRow}
+    <div class="card-grid">
+      ${sortedBlocks.map((b) => buildSectionHtml(b)).join("")}
+    </div>
+  `;
+    if (cardLayoutEdit) {
+      cardEl.classList.add("card-layout-edit");
+      setupCardDrag();
+    } else {
+      cardEl.classList.remove("card-layout-edit");
+    }
+    requestAnimationFrame(() => {
+      if (!cardEl || !cardVisible) return;
+      cardHeight = cardEl.offsetHeight + CARD_GAP;
+      updateCardPlacement();
+      renderList();
+    });
+  } catch (err) {
+    console.error("renderCard error", err);
+    logClientEvent("card_render_error", {
+      unitId: detail?.item?.id,
+      message: err?.message || String(err),
+      stack: err?.stack || null,
+    });
+    showToast("Не удалось отобразить карточку");
+  }
+}
+
+
+function initMap() {
+  const saved = localStorage.getItem(MAP_KEY);
+  let center = [55.75, 37.61];
+  let zoom = 5;
+  if (saved) {
+    try {
+      const obj = JSON.parse(saved);
+      center = obj.center || center;
+      zoom = obj.zoom || zoom;
+    } catch {}
+  }
+  const baseImg = "https://unpkg.com/leaflet@1.9.4/dist/images/";
+  L.Icon.Default.mergeOptions({
+    iconRetinaUrl: `${baseImg}marker-icon-2x.png`,
+    iconUrl: `${baseImg}marker-icon.png`,
+    shadowUrl: `${baseImg}marker-shadow.png`,
+  });
+  map = L.map("map", { zoomControl: true }).setView(center, zoom);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: "&copy; OpenStreetMap",
+  }).addTo(map);
+  map.on("moveend", () => {
+    const c = map.getCenter();
+    localStorage.setItem(MAP_KEY, JSON.stringify({ center: [c.lat, c.lng], zoom: map.getZoom() }));
+  });
+}
+
+function ensureCluster() {
+  if (!map) return;
+  if (!cluster && L.markerClusterGroup) {
+    cluster = L.markerClusterGroup({
+      chunkedLoading: true,
+      maxClusterRadius: 80,
+      disableClusteringAtZoom: 16,
+      spiderfyOnEveryZoom: false,
+    });
+    map.addLayer(cluster);
+  }
+}
+
+function detachMarker(id) {
+  const marker = markerById.get(id);
+  if (!marker) return;
+  if (cluster) {
+    cluster.removeLayer(marker);
+  } else if (map && map.hasLayer(marker)) {
+    map.removeLayer(marker);
+  }
+  markerById.delete(id);
+}
+
+function wireMarker(unit) {
+  const marker = L.marker([unit.lat, unit.lon]);
+  marker.on("click", () => selectUnit(unit.id));
+  marker.on("mouseover", (e) => showTooltip(unit, e.originalEvent.clientX, e.originalEvent.clientY));
+  marker.on("mousemove", (e) => showTooltip(unit, e.originalEvent.clientX, e.originalEvent.clientY));
+  marker.on("mouseout", hideTooltip);
+  markerById.set(unit.id, marker);
+  if (cluster) cluster.addLayer(marker);
+  else marker.addTo(map);
+  return marker;
+}
+
+function syncMarkers(list) {
+  if (!map) return;
+  ensureCluster();
+  const nextVisible = new Set();
+  list.forEach((u) => {
+    if (u.lat == null || u.lon == null) {
+      detachMarker(u.id);
+      return;
+    }
+    nextVisible.add(u.id);
+    const existing = markerById.get(u.id);
+    if (existing) {
+      existing.setLatLng([u.lat, u.lon]);
+      return;
+    }
+    wireMarker(u);
+  });
+  Array.from(markerById.keys()).forEach((id) => {
+    if (!nextVisible.has(id)) {
+      detachMarker(id);
+    }
+  });
+  if (!nextVisible.size) {
+    hideTooltip();
+  }
+}
+
+function focusMarker(item) {
+  if (!item || !map) return;
+  const marker = markerById.get(item.id);
+  if (marker && cluster) {
+    cluster.zoomToShowLayer(marker, () => {
+      map.setView([item.lat, item.lon], Math.max(map.getZoom(), 14));
+    });
+  } else if (item.lat && item.lon) {
+    map.setView([item.lat, item.lon], Math.max(map.getZoom(), 14));
+  }
+}
+
+/* Tooltip */
+function showTooltip(unit, x, y) {
+  if (!tooltipEl) return;
+  const data = unit.tooltip_data || {};
+  const online = data.online ?? unit.online;
+  const statusLabel = data.status_label || unit.status_label || "";
+  const status = online ? "🟢 Онлайн" : "🔴 Оффлайн";
+  const last = formatRelativeTime(data.last_ts ?? unit.last_ts);
+  const speed = data.speed ?? unit.speed;
+  const address = data.address || "";
+  const geofences = Array.isArray(data.geofences) ? data.geofences : [];
+  const parts = [`<div><strong>${unit.name}</strong></div>`, `<div>${status} — ${statusLabel}</div>`, `<div>Последнее: ${last}</div>`];
+  if (!online && unit.offline_reason) {
+    parts.push(`<div>${unit.offline_reason}</div>`);
+  }
+  if (speed != null) parts.push(`<div>Скорость: ${Math.round(speed)} км/ч</div>`);
+  if (address) parts.push(`<div>${address}</div>`);
+  if (geofences.length) parts.push(`<div>Геозоны: ${geofences.join(", ")}</div>`);
+  tooltipEl.innerHTML = parts.join("");
+  tooltipEl.classList.remove("hidden");
+  const width = tooltipEl.offsetWidth || 220;
+  const height = tooltipEl.offsetHeight || 100;
+  const left = Math.min(x + 16, window.innerWidth - width - 10);
+  const top = Math.min(y + 16, window.innerHeight - height - 10);
+  tooltipEl.style.left = `${left}px`;
+  tooltipEl.style.top = `${top}px`;
+}
+
+function hideTooltip() {
+  if (tooltipEl) tooltipEl.classList.add("hidden");
+}
+
+function formatRelativeTime(ts) {
+  if (!ts) return "нет данных";
+  const numericTs = Number(ts);
+  if (!Number.isFinite(numericTs)) return "нет данных";
+  const now = Date.now() / 1000;
+  const diff = Math.max(0, Math.floor(now - numericTs));
+  if (diff < 60) return `${diff} c назад`;
+  if (diff < 3600) return `${Math.floor(diff / 60)} мин назад`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)} ч назад`;
+  return `${Math.floor(diff / 86400)} дн назад`;
+}
+
+function formatCoord(value) {
+  if (value == null) return "—";
+  return Number(value).toFixed(5);
+}
+
+function initClock() {
+  const el = document.getElementById("clock");
+  setInterval(() => (el.textContent = new Date().toLocaleString()), 1000);
+}
+
+function initModal() {
+  ["modal-name", "modal-uid", "modal-hw"].forEach((id) => {
+    const el = document.getElementById(id);
+    el.addEventListener("input", applyModalFilter);
+  });
+  document.getElementById("modal-show-map").addEventListener("change", (e) => {
+    modalState.showOnMap = e.target.checked;
+  });
+  document.getElementById("modal-close").addEventListener("click", closeModal);
+  document.getElementById("modal-cancel").addEventListener("click", closeModal);
+  document.getElementById("modal-add-selected").addEventListener("click", () => {
+    addUnits(Array.from(modalState.selected), false);
+  });
+  document.getElementById("modal-add-found").addEventListener("click", () => {
+    addUnits(modalState.filtered.map((u) => u.id), false);
+  });
+  document.getElementById("modal-replace").addEventListener("click", () => {
+    addUnits(modalState.filtered.map((u) => u.id), true);
+  });
+}
+
+/* Modal: добавление объектов */
+function openModal() {
+  modalState.selected = new Set();
+  modalState.showOnMap = false;
+  document.getElementById("modal-name").value = "";
+  document.getElementById("modal-uid").value = "";
+  document.getElementById("modal-hw").value = "";
+  document.getElementById("modal-show-map").checked = false;
+  applyModalFilter();
+  document.getElementById("modal-overlay").classList.remove("hidden");
+}
+
+function closeModal() {
+  document.getElementById("modal-overlay").classList.add("hidden");
+}
+
+function applyModalFilter() {
+  const nameQ = document.getElementById("modal-name").value.trim().toLowerCase();
+  const uidQ = document.getElementById("modal-uid").value.trim().toLowerCase();
+  const hwQ = document.getElementById("modal-hw").value.trim().toLowerCase();
+  modalState.filtered = units.filter((u) => {
+    const nameHit = !nameQ || u.name.toLowerCase().includes(nameQ);
+    const uidHit = !uidQ || (u.uid || "").toLowerCase().includes(uidQ);
+    const hwHit = !hwQ || (u.hw || "").toLowerCase().includes(hwQ);
+    return nameHit && uidHit && hwHit;
+  });
+  renderModalList(true);
+}
+
+function renderModalList(rebuild = false) {
+  const box = document.getElementById("modal-list");
+  if (rebuild) {
+    box.innerHTML = "";
+    modalRowById.clear();
+    modalState.filtered.forEach((u) => {
+      const row = document.createElement("div");
+      row.className = "modal-row";
+      row.dataset.id = String(u.id);
+      const checked = modalState.selected.has(u.id);
+      row.innerHTML = `
+        <input type="checkbox" ${checked ? "checked" : ""}>
+        <div>
+          <div class="unit-name">${u.name}</div>
+          <div class="unit-meta">${u.uid || "—"}</div>
+        </div>
+        <div class="unit-meta">${u.hw || ""}</div>
+        <div class="unit-meta">${u.online ? "🟢" : "🔴"}</div>
+      `;
+      const cb = row.querySelector("input");
+      cb.addEventListener("click", (e) => {
+        e.stopPropagation();
+        toggleSelect(u.id, !modalState.selected.has(u.id));
+      });
+      row.addEventListener("click", () => toggleSelect(u.id, !modalState.selected.has(u.id)));
+      row.addEventListener("mouseenter", (e) => {
+        showTooltip(u, e.clientX, e.clientY);
+      });
+      row.addEventListener("mousemove", (e) => {
+        showTooltip(u, e.clientX, e.clientY);
+      });
+      row.addEventListener("mouseleave", hideTooltip);
+      row.addEventListener("dblclick", async () => {
+        await addUnits([u.id], false);
+        if (modalState.showOnMap) focusMarker(u);
+      });
+      row.classList.toggle("checked", checked);
+      modalRowById.set(u.id, row);
+      box.appendChild(row);
+    });
+  } else {
+    modalState.filtered.forEach((u) => {
+      const row = modalRowById.get(u.id);
+      if (!row) return;
+      const cb = row.querySelector("input");
+      const checked = modalState.selected.has(u.id);
+      cb.checked = checked;
+      row.classList.toggle("checked", checked);
+    });
+  }
+  const addSel = document.getElementById("modal-add-selected");
+  const addFound = document.getElementById("modal-add-found");
+  const replaceBtn = document.getElementById("modal-replace");
+  addSel.disabled = modalState.selected.size === 0;
+  addFound.disabled = modalState.filtered.length === 0;
+  replaceBtn.disabled = modalState.filtered.length === 0;
+  modalStatus();
+}
+
+function toggleSelect(id, on) {
+  if (on) modalState.selected.add(id);
+  else modalState.selected.delete(id);
+  const row = modalRowById.get(id);
+  if (row) {
+    const cb = row.querySelector("input");
+    cb.checked = on;
+    row.classList.toggle("checked", on);
+  }
+  renderModalList(false);
+}
+
+async function addUnits(ids, replace) {
+  if (!ids.length) {
+    showToast("Выберите объекты");
+    return;
+  }
+  const url = "/web/api/worklist";
+  const method = replace ? "PUT" : "POST";
+  const res = await authFetch(url, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ unit_ids: ids }),
+  });
+  if (!res.ok) {
+    showToast("Не удалось изменить рабочий список");
+    return;
+  }
+  const data = await res.json();
+  worklist = new Set(data);
+  applyFilters();
+  if (modalState.showOnMap && ids.length > 0) {
+    const u = units.find((x) => x.id === ids[0]);
+    if (u) focusMarker(u);
+  }
+  showToast(replace ? "Список заменён" : "Добавлено");
+  renderModalList(false);
+}
+
+function showToast(text) {
+  setStatus(text);
+}
+
+function modalStatus() {
+  const el = document.getElementById("modal-status");
+  if (!el) return;
+  el.textContent = `Найдено: ${modalState.filtered.length}, выбрано: ${modalState.selected.size}`;
+}
+
+async function main() {
+  tooltipEl = document.getElementById("unit-tooltip");
+  cardEl = document.getElementById("unit-card");
+  userLabelEl = document.getElementById("user-label");
+  adminBtn = document.getElementById("btn-admin");
+  logoutBtn = document.getElementById("btn-logout");
+  adminModal = document.getElementById("admin-modal");
+  adminUsersEl = document.getElementById("admin-users");
+  adminNodesEl = document.getElementById("admin-nodes");
+  adminUnassignedEl = document.getElementById("admin-unassigned");
+  adminAssignNodeInput = document.getElementById("admin-assign-node");
+  adminAssignUnitsInput = document.getElementById("admin-assign-units");
+  adminMsgEl = document.getElementById("admin-msg");
+  if (logoutBtn) logoutBtn.addEventListener("click", logout);
+  if (adminBtn) {
+    adminBtn.addEventListener("click", openAdmin);
+  }
+  const adminClose = document.getElementById("admin-close");
+  if (adminClose) adminClose.addEventListener("click", () => adminModal.classList.add("hidden"));
+  const adminAssignBtn = document.getElementById("admin-assign-btn");
+  if (adminAssignBtn) adminAssignBtn.addEventListener("click", assignOwners);
+  if (cardEl) {
+    cardEl.classList.add("hidden");
+    cardEl.style.top = "-9999px";
+  }
+  ensureListDom();
+  initMap();
+  initClock();
+  initModal();
+  initTabModalFilters();
+  initLayout();
+  const btnAddTab = document.getElementById("btn-add-tab");
+  if (btnAddTab) btnAddTab.addEventListener("click", openTabModal);
+  const tabClose = document.getElementById("tab-close");
+  if (tabClose) tabClose.addEventListener("click", closeTabModal);
+  const tabCancel = document.getElementById("tab-cancel");
+  if (tabCancel) tabCancel.addEventListener("click", closeTabModal);
+  const tabSave = document.getElementById("tab-save");
+  if (tabSave) tabSave.addEventListener("click", saveTabFromModal);
+  const btnCardSettings = document.getElementById("btn-card-settings");
+  if (btnCardSettings) btnCardSettings.addEventListener("click", openCardSettingsModal);
+  const csClose = document.getElementById("card-settings-close");
+  if (csClose) csClose.addEventListener("click", closeCardSettingsModal);
+  const csCloseBottom = document.getElementById("card-settings-close-bottom");
+  if (csCloseBottom) csCloseBottom.addEventListener("click", closeCardSettingsModal);
+  const csReset = document.getElementById("card-settings-reset");
+  if (csReset) csReset.addEventListener("click", resetCardSettings);
+  if (cardEl) {
+    cardEl.addEventListener("click", handleCardClick);
+  }
+  initLoginModal();
+  await ensureSession();
+  try {
+    const cachedInfo = localStorage.getItem(SESSION_INFO_KEY);
+    if (cachedInfo) applySessionInfo(JSON.parse(cachedInfo));
+  } catch {}
+  fetchSessionInfo().catch(() => {});
+  await fetchPanelSettings();
+  renderTabs();
+  restoreSearchForActiveTab();
+  await loadWorklist();
+  await loadUnits({ restartLive: true });
+  renderList();
+}
+
+main().catch((e) => {
+  console.error(e);
+  setStatus("Ошибка инициализации");
+});
+
+function openCardSettingsModal() {
+  renderCardOrderList();
+  document.getElementById("card-settings-modal").classList.remove("hidden");
+}
+
+function closeCardSettingsModal() {
+  document.getElementById("card-settings-modal").classList.add("hidden");
+}
+
+function renderCardOrderList() {
+  const list = document.getElementById("card-order-list");
+  if (!list) return;
+  const keys = loadCardOrder();
+  cardOrder = keys;
+  const mutableKeys = keys.filter((k) => !FIXED_CARD_KEYS.includes(k));
+  // build rows if not cached
+  mutableKeys.forEach((k) => {
+    if (orderRowByKey.has(k)) return;
+    const row = document.createElement("div");
+    row.className = "order-item";
+    row.dataset.key = k;
+    row.draggable = true;
+    row.innerHTML = `
+      <span class="handle" aria-hidden="true">☰</span>
+      <span class="title">
+        <label class="checkbox-inline">
+          <input type="checkbox" data-order-key="${k}" ${cardSettings[k] ? "checked" : ""}/>
+          <span class="label-text">${cardSectionTitle(k)}</span>
+        </label>
+      </span>
+    `;
+    row.addEventListener("dragstart", onOrderDragStart);
+    row.addEventListener("dragover", onOrderDragOver);
+    row.addEventListener("dragleave", onOrderDragLeave);
+    row.addEventListener("drop", onOrderDrop);
+    row.addEventListener("keydown", onOrderKeyDown);
+    orderRowByKey.set(k, row);
+  });
+
+  // sync checkbox states
+  orderRowByKey.forEach((row, key) => {
+    const cb = row.querySelector("input[type=checkbox][data-order-key]");
+    if (cb) {
+      cb.checked = !!cardSettings[key];
+      cb.disabled = false;
+      cb.removeEventListener("change", onOrderCheckboxChange);
+      cb.addEventListener("change", onOrderCheckboxChange);
+    }
+  });
+
+  list.innerHTML = "";
+  mutableKeys.forEach((k) => {
+    const el = orderRowByKey.get(k);
+    if (el) list.appendChild(el);
+  });
+  if (!list.dataset.wired) {
+    list.addEventListener("dragover", onOrderListDragOver);
+    list.addEventListener("drop", onOrderListDrop);
+    list.dataset.wired = "1";
+  }
+}
+
+let orderDragKey = null;
+let orderDropTarget = null; // {type:'before', key} | {type:'end'}
+function onOrderDragStart(e) {
+  orderDragKey = e.currentTarget.dataset.key;
+  e.dataTransfer.effectAllowed = "move";
+  const list = document.getElementById("card-order-list");
+  if (list) list.classList.add("dragging");
+}
+function onOrderDragOver(e) {
+  e.preventDefault();
+  const row = e.currentTarget;
+  clearDragHighlights();
+  orderDropTarget = { type: "before", key: row.dataset.key };
+  row.classList.add("drag-over");
+}
+function onOrderDragLeave(e) {
+  e.currentTarget.classList.remove("drag-over");
+}
+function onOrderDrop(e) {
+  e.preventDefault();
+  const row = e.currentTarget;
+  row.classList.remove("drag-over");
+  if (!orderDragKey || !orderDropTarget) {
+    clearDragHighlights();
+    return;
+  }
+  const mutable = cardOrder.filter((k) => !FIXED_CARD_KEYS.includes(k));
+  const fromIdx = mutable.indexOf(orderDragKey);
+  if (fromIdx === -1) {
+    clearDragHighlights();
+    return;
+  }
+  mutable.splice(fromIdx, 1);
+  if (orderDropTarget.type === "before") {
+    const toIdx = mutable.indexOf(orderDropTarget.key);
+    if (toIdx === -1) mutable.push(orderDragKey);
+    else mutable.splice(toIdx, 0, orderDragKey);
+  } else {
+    mutable.push(orderDragKey);
+  }
+  applyOrder(mutable);
+  clearDragHighlights();
+}
+
+function onOrderCheckboxChange(e) {
+  const key = e.target.dataset.orderKey;
+  cardSettings[key] = e.target.checked;
+  saveCardSettings();
+  persistPanelSettings();
+  if (currentCardDetail) renderCard(currentCardDetail);
+}
+
+function onOrderKeyDown(e) {
+  const key = e.currentTarget.dataset.key;
+  if (!key) return;
+  if (!e.ctrlKey) return;
+  const mutable = cardOrder.filter((k) => !FIXED_CARD_KEYS.includes(k));
+  const idx = mutable.indexOf(key);
+  if (idx === -1) return;
+  if (e.key === "Home") {
+    mutable.splice(idx, 1);
+    mutable.unshift(key);
+    applyOrder(mutable);
+    e.preventDefault();
+  } else if (e.key === "End") {
+    mutable.splice(idx, 1);
+    mutable.push(key);
+    applyOrder(mutable);
+    e.preventDefault();
+  }
+}
+
+function clearDragHighlights() {
+  document.querySelectorAll(".order-item.drag-over").forEach((el) => el.classList.remove("drag-over"));
+  orderDropTarget = null;
+  const list = document.getElementById("card-order-list");
+  if (list) list.classList.remove("dragging");
+}
+
+function onOrderListDragOver(e) {
+  e.preventDefault();
+  orderDropTarget = { type: "end" };
+}
+
+function onOrderListDrop(e) {
+  e.preventDefault();
+  if (!orderDragKey) return;
+  orderDropTarget = { type: "end" };
+  onOrderDrop(e);
+}
+
+function applyOrder(mutableKeys) {
+  cardOrder = [...FIXED_CARD_KEYS, ...mutableKeys];
+  saveCardOrder(cardOrder);
+  persistPanelSettings();
+  if (currentCardDetail) renderCard(currentCardDetail);
+}
+
+// --- Inline card drag ---
+function setupCardDrag() {
+  if (!cardEl) return;
+  const blocks = Array.from(cardEl.querySelectorAll(".card-grid > .card-block")).filter(
+    (el) => !FIXED_CARD_KEYS.includes(el.dataset.sectionKey)
+  );
+  const grid = cardEl.querySelector(".card-grid");
+  blocks.forEach((el) => {
+    el.addEventListener("dragstart", onCardDragStart);
+    el.addEventListener("dragend", onCardDragEnd);
+    el.addEventListener("dragover", onCardDragOver);
+    el.addEventListener("dragleave", onCardDragLeave);
+    el.addEventListener("drop", onCardDrop);
+  });
+  if (grid) {
+    grid.addEventListener("dragover", (e) => {
+      if (!cardLayoutEdit || !cardDragKey) return;
+      e.preventDefault();
+    });
+    grid.addEventListener("drop", (e) => {
+      if (!cardLayoutEdit || !cardDragKey) return;
+      if (e.target.closest(".card-block")) return; // block-level drop handles reorder
+      const draggedEl = grid.querySelector(`[data-section-key="${cardDragKey}"]`);
+      if (draggedEl) {
+        grid.appendChild(draggedEl);
+        applyOrderFromDom();
+      }
+    });
+  }
+}
+
+function onCardDragStart(e) {
+  const key = e.currentTarget.dataset.sectionKey || e.target.dataset.sectionKey;
+  if (!key || FIXED_CARD_KEYS.includes(key)) {
+    e.preventDefault();
+    return;
+  }
+  cardDragKey = key;
+  e.dataTransfer.effectAllowed = "move";
+  e.currentTarget.classList.add("dragging");
+}
+
+function onCardDragEnd() {
+  if (cardLayoutEdit && cardDragKey) {
+    applyOrderFromDom();
+  }
+  cardDragKey = null;
+  clearCardHighlights();
+  document.querySelectorAll(".card-block.dragging").forEach((el) => el.classList.remove("dragging"));
+}
+
+function onCardDragOver(e) {
+  if (!cardLayoutEdit || !cardDragKey) return;
+  e.preventDefault();
+  const key = e.currentTarget.dataset.sectionKey;
+  if (!key || key === cardDragKey || FIXED_CARD_KEYS.includes(key)) return;
+  const grid = cardEl?.querySelector(".card-grid");
+  const draggedEl = grid?.querySelector(`[data-section-key="${cardDragKey}"]`);
+  const targetEl = grid?.querySelector(`[data-section-key="${key}"]`);
+  if (!grid || !draggedEl || !targetEl || draggedEl === targetEl) return;
+
+  // текущий порядок
+  const order = Array.from(grid.children);
+  const dragIdx = order.indexOf(draggedEl);
+  const targetIdx = order.indexOf(targetEl);
+  if (dragIdx === -1 || targetIdx === -1) return;
+
+  // dead‑zone для стабилизации: реагируем только если зашли в верхние 30% (before) или нижние 30% (after)
+  const rect = targetEl.getBoundingClientRect();
+  const ratio = (e.clientY - rect.top) / rect.height;
+  const moveBefore = ratio < 0.4;
+  const moveAfter = ratio > 0.6;
+
+  if (dragIdx < targetIdx) {
+    // двигаем вниз, вставляем только если зашли в нижнюю зону или есть блоки между
+    if (moveAfter || dragIdx < targetIdx - 1) {
+      grid.insertBefore(draggedEl, targetEl.nextSibling);
+    }
+  } else if (dragIdx > targetIdx) {
+    // двигаем вверх, вставляем если в верхнюю зону или есть блоки между
+    if (moveBefore || dragIdx > targetIdx + 1) {
+      grid.insertBefore(draggedEl, targetEl);
+    }
+  }
+
+  highlightTarget(targetEl);
+}
+
+function onCardDragLeave(e) {
+  e.currentTarget.classList.remove("drag-over");
+}
+
+function onCardDrop(e) {
+  if (!cardLayoutEdit || !cardDragKey) return;
+  e.preventDefault();
+  clearCardHighlights();
+}
+
+function applyOrderFromDom() {
+  if (!cardEl) return;
+  const keys = Array.from(cardEl.querySelectorAll(".card-grid > .card-block"))
+    .map((el) => el.dataset.sectionKey)
+    .filter((k) => k && !FIXED_CARD_KEYS.includes(k));
+  applyOrder(keys);
+}
+
+function clearCardHighlights() {
+  document.querySelectorAll(".card-block.drag-over").forEach((el) => el.classList.remove("drag-over"));
+}
+
+function highlightTarget(el) {
+  clearCardHighlights();
+  el.classList.add("drag-over");
+}
+
+function handleCardClick(e) {
+  const action = e.target.dataset.action;
+  if (!action) return;
+  if (action === "card-close") {
+    hideCard();
+  } else if (action === "card-nearby") {
+    toggleNearbySection();
+  } else if (action === "card-layout-toggle") {
+    cardLayoutEdit = !cardLayoutEdit;
+    if (currentCardDetail) renderCard(currentCardDetail);
+  } else if (action === "card-layout-reset") {
+    resetCardSettings();
+    cardLayoutEdit = true;
+    if (currentCardDetail) renderCard(currentCardDetail);
+  } else if (action === "card-select") {
+    const targetId = Number(e.target.dataset.unitId || e.target.closest("button")?.dataset.unitId);
+    if (targetId) {
+      selectUnit(targetId);
+    }
+  } else if (action === "copy-coords") {
+    const lat = currentCardDetail?.item?.lat;
+    const lon = currentCardDetail?.item?.lon;
+    if (lat != null && lon != null) {
+      copyText(`${lat}, ${lon}`);
+      showToast("Координаты скопированы");
+    } else {
+      showToast("Координаты недоступны");
+    }
+  } else if (action === "open-map") {
+    if (currentCardDetail?.item && currentCardDetail.item.lat && currentCardDetail.item.lon) {
+      const { lat, lon } = currentCardDetail.item;
+      window.open(`https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=18/${lat}/${lon}`, "_blank");
+    }
+  } else if (action === "card-section-toggle") {
+    const key = e.target.dataset.sectionKey;
+    if (!key) return;
+    cardSettings[key] = !cardSettings[key];
+    saveCardSettings();
+    persistPanelSettings();
+    if (currentCardDetail) renderCard(currentCardDetail);
+  }
+}
+
+function hideCard() {
+  cardVisible = false;
+  expandedIndex = null;
+  cardHeight = 0;
+  selectedId = null;
+  currentCardDetail = null;
+  resetNearbyState(null);
+  if (cardEl) {
+    cardEl.classList.add("hidden");
+    cardEl.style.top = "-9999px";
+  }
+  renderList();
+  logClientEvent("card_hidden", {});
+}
+
+function updateCardPlacement() {
+  if (!cardEl) return;
+  if (!cardVisible || expandedIndex == null) {
+    cardEl.classList.add("hidden");
+    return;
+  }
+  const base = (expandedIndex + 1) * ROW_H + CARD_ANCHOR_OFFSET;
+  cardEl.style.top = `${base}px`;
+  cardEl.classList.remove("hidden");
+}
+
+function copyText(text) {
+  if (!text) return;
+  navigator.clipboard?.writeText(text).catch(() => {});
+}
+
+async function runUnitAction(action) {
+  if (!selectedId) {
+    showToast("Сначала выберите объект");
+    return;
+  }
+  try {
+    const res = await authFetch(`/web/api/units/${selectedId}/actions/${action}`, { method: "POST" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (data.result?.device_ts) {
+      const when = new Date((data.result.device_ts || 0) * 1000).toLocaleString();
+      showToast(`Последнее сообщение: ${when}`);
+    } else {
+      showToast("Действие выполнено");
+    }
+  } catch (err) {
+    console.error("runUnitAction", err);
+    showToast("Не удалось выполнить действие");
+  }
+}
+
+function rebuildUnitIndex() {
+  unitsById = new Map();
+  units.forEach((u) => {
+    unitsById.set(u.id, u);
+  });
+}
+
+function sortUnits() {
+  // Оставляем исходный порядок (по имени) только один раз при загрузке,
+  // далее порядок не трогаем, чтобы элементы не прыгали.
+  units.sort((a, b) => a.name.localeCompare(b.name, "ru", { sensitivity: "base" }));
+}
+
+function scheduleLiveUpdates(reset = false) {
+  if (reset && liveTimer) {
+    clearTimeout(liveTimer);
+    liveTimer = null;
+  }
+  if (liveTimer) return;
+  liveTimer = setTimeout(fetchLiveUpdates, FEED_INTERVAL_MS);
+}
+
+async function fetchLiveUpdates() {
+  if (liveInFlight) {
+    scheduleLiveUpdates();
+    return;
+  }
+  liveInFlight = true;
+  try {
+    const watchIds = getWatchIds().slice(0, 400);
+    const qsParts = [];
+    if (feedSince) qsParts.push(`since=${encodeURIComponent(feedSince)}`);
+    if (watchIds.length) qsParts.push(`watch_ids=${watchIds.join(",")}`);
+    const qs = qsParts.length ? `?${qsParts.join("&")}` : "";
+    const res = await authFetch(`/web/api/units/feed${qs}`);
+    if (!res.ok) throw new Error("feed http " + res.status);
+    const data = await res.json();
+    if (typeof data.ts === "number") {
+      feedSince = data.ts;
+    }
+    if (data.reset) {
+      await loadUnits({ restartLive: true });
+      return;
+    }
+    if (Array.isArray(data.updates) && data.updates.length) {
+      applyFeedUpdates(data.updates);
+    }
+  } catch (err) {
+    console.warn("live updates failed", err);
+  } finally {
+    liveInFlight = false;
+    liveTimer = null;
+    scheduleLiveUpdates();
+  }
+}
+
+function applyFeedUpdates(updates) {
+  let changed = false;
+  const touched = new Set();
+  updates.forEach((patch) => {
+    const unit = unitsById.get(patch.id);
+    if (!unit) {
+      return;
+    }
+    touched.add(patch.id);
+    changed = mergeUnitPatch(unit, patch) || changed;
+  });
+  if (!changed) return;
+  lastLiveUpdated = Date.now();
+  // Не пересортировываем список, чтобы объекты не прыгали.
+  applyFilters();
+  if (selectedId && touched.has(selectedId)) {
+    refreshCurrentCard();
+  }
+}
+
+function mergeUnitPatch(unit, patch) {
+  let mutated = false;
+  [
+    "online",
+    "status",
+    "status_label",
+    "last_ts",
+    "last_ts_age_sec",
+    "ignition",
+    "lat",
+    "lon",
+    "speed",
+    "has_fuel",
+    "offline_reason",
+    "tooltip_data",
+  ].forEach((key) => {
+    if (Object.prototype.hasOwnProperty.call(patch, key) && unit[key] !== patch[key]) {
+      unit[key] = patch[key];
+      mutated = true;
+    }
+  });
+  return mutated;
+}
+
+async function refreshCurrentCard() {
+  if (!selectedId) return;
+  try {
+    const res = await authFetch(`/web/api/units/${selectedId}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    currentCardDetail = data;
+    renderCard(data);
+  } catch (err) {
+    console.warn("card refresh failed", err);
+  }
+}
+
+function loadTabState() {
+  try {
+    const raw = localStorage.getItem(TAB_STATE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") return parsed;
+    return {};
+  } catch {
+    return {};
+  }
+}
+
+function saveTabState() {
+  localStorage.setItem(TAB_STATE_KEY, JSON.stringify(tabState));
+}
+
+function setTabState(tabId, patch) {
+  if (!tabId) return;
+  const prev = tabState[tabId] || {};
+  tabState[tabId] = { ...prev, ...patch };
+  saveTabState();
+}
+
+function deleteTabState(tabId) {
+  if (!tabId || !tabState[tabId]) return;
+  delete tabState[tabId];
+  saveTabState();
+}
+
+function restoreSearchForActiveTab() {
+  const input = document.getElementById("search");
+  if (!input) return;
+  const state = tabState[activeTabId];
+  const target = state?.search ?? "";
+  if (input.value !== target) {
+    input.value = target;
+  }
+}
+
+function ensureWorkTabList(tabs) {
+  let result = Array.isArray(tabs) ? tabs.filter(Boolean).map((tab) => ({ ...tab })) : [];
+  if (!result.some((tab) => tab.id === "work")) {
+    result = [Object.assign({}, DEFAULT_TABS[0]), ...result];
+  }
+  return result;
+}
+
+function loadSidebarWidth() {
+  const raw = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+  const parsed = Number.parseInt(raw || "", 10);
+  if (Number.isFinite(parsed)) {
+    return clampSidebarWidth(parsed);
+  }
+  return 380;
+}
+
+function clampSidebarWidth(value) {
+  return Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, value));
+}
+
+function applySidebarWidth(width) {
+  sidebarWidth = clampSidebarWidth(width);
+  document.documentElement.style.setProperty("--sidebar-width", `${sidebarWidth}px`);
+}
+
+function resetNearbyState(unitId) {
+  if (unitId == null) {
+    nearbyCardState = { unitId: null, visible: false, list: [] };
+  } else {
+    nearbyCardState = { unitId, visible: false, list: [] };
+  }
+}
+
+function toggleNearbySection() {
+  if (!currentCardDetail?.item) return;
+  const unitId = currentCardDetail.item.id;
+  if (nearbyCardState.visible) {
+    nearbyCardState = { unitId, visible: false, list: [] };
+    renderCard(currentCardDetail);
+    return;
+  }
+  const list = computeNearbyUnits(currentCardDetail.item);
+  if (!list.length) {
+    showToast("Нет координат для расчёта");
+    return;
+  }
+  nearbyCardState = { unitId, visible: true, list };
+  renderCard(currentCardDetail);
+}
+
+function computeNearbyUnits(baseItem) {
+  const baseLat = Number(baseItem.lat);
+  const baseLon = Number(baseItem.lon);
+  if (!Number.isFinite(baseLat) || !Number.isFinite(baseLon)) {
+    return [];
+  }
+  return units
+    .map((u) => ({ ...u, latNum: Number(u.lat), lonNum: Number(u.lon) }))
+    .filter((u) => u.id !== baseItem.id && Number.isFinite(u.latNum) && Number.isFinite(u.lonNum))
+    .map((u) => {
+      const distKm = haversineKm(baseLat, baseLon, u.latNum, u.lonNum);
+      const formatted = formatDistance(distKm);
+      return {
+        id: u.id,
+        name: u.name,
+        distance: formatted.label,
+        distanceVal: formatted.value,
+      };
+    })
+    .sort((a, b) => a.distanceVal - b.distanceVal)
+    .slice(0, 5);
+}
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const R = 6371;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+function formatDistance(km) {
+  if (!Number.isFinite(km)) {
+    return { label: "—", value: Infinity };
+  }
+  if (km < 1) {
+    const meters = Math.round(km * 1000);
+    return { label: `${meters} м`, value: km };
+  }
+  const fixed = km < 10 ? km.toFixed(1) : km.toFixed(0);
+  return { label: `${fixed} км`, value: km };
+}
+
+function initLayout() {
+  applySidebarWidth(sidebarWidth);
+  const resizer = document.getElementById("sidebar-resizer");
+  if (!resizer) return;
+  resizer.addEventListener("pointerdown", startResize);
+}
+
+let resizeStartX = 0;
+let resizeStartWidth = sidebarWidth;
+
+function startResize(event) {
+  event.preventDefault();
+  resizerPointerId = event.pointerId;
+  resizeStartX = event.clientX;
+  resizeStartWidth = sidebarWidth;
+  const resizer = document.getElementById("sidebar-resizer");
+  if (resizer) {
+    resizer.classList.add("dragging");
+    resizer.setPointerCapture(resizerPointerId);
+  }
+  window.addEventListener("pointermove", onResizeMove);
+  window.addEventListener("pointerup", stopResize);
+}
+
+function onResizeMove(event) {
+  if (resizerPointerId !== event.pointerId) return;
+  const delta = event.clientX - resizeStartX;
+  applySidebarWidth(resizeStartWidth + delta);
+}
+
+function stopResize(event) {
+  if (resizerPointerId !== event.pointerId) return;
+  const resizer = document.getElementById("sidebar-resizer");
+  if (resizer) {
+    resizer.classList.remove("dragging");
+    resizer.releasePointerCapture(resizerPointerId);
+  }
+  window.removeEventListener("pointermove", onResizeMove);
+  window.removeEventListener("pointerup", stopResize);
+  resizerPointerId = null;
+  localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth));
+}
+
+function filterRowTemplate(row, index, total, sensorListId) {
+  const kind = row.kind || "sensor";
+  const value = row.value || "";
+  const valueControl =
+    kind === "status"
+      ? buildStatusSelect(value)
+      : `<input class="filter-value" type="text" placeholder="Название датчика" ${sensorListId ? `list="${sensorListId}"` : ""} value="${value}" />`;
+  return `
+    <div class="filter-row" data-index="${index}">
+      <select class="filter-kind">
+        <option value="sensor" ${kind === "sensor" ? "selected" : ""}>Датчик</option>
+        <option value="status" ${kind === "status" ? "selected" : ""}>Статус</option>
+      </select>
+      ${valueControl}
+      <button class="ghost icon" data-action="filter-remove" ${total <= 1 ? "disabled" : ""} title="Удалить условие">✕</button>
+    </div>
+  `;
+}
+
+function buildStatusSelect(value) {
+  return `
+    <select class="filter-value">
+      <option value="online" ${value === "online" ? "selected" : ""}>Только онлайн</option>
+      <option value="offline" ${value === "offline" ? "selected" : ""}>Только оффлайн</option>
+      <option value="has_fuel" ${value === "has_fuel" ? "selected" : ""}>Есть ДУТ</option>
+    </select>
+  `;
+}
+
+function initTabModalFilters() {
+  const rowsBox = document.getElementById("tab-filter-rows");
+  const addBtn = document.getElementById("tab-filter-add");
+  if (!rowsBox || !addBtn) return;
+  if (!tabFilterRows.length) {
+    tabFilterRows = [{ kind: "sensor", value: "" }];
+  }
+  rowsBox.addEventListener("input", handleTabFilterInput);
+  rowsBox.addEventListener("change", handleTabFilterInput);
+  rowsBox.addEventListener("click", handleTabFilterClick);
+  addBtn.addEventListener("click", () => {
+    tabFilterRows.push({ kind: "sensor", value: "" });
+    renderTabFilterRows();
+  });
+  renderTabFilterRows();
+}
+
+function renderTabFilterRows() {
+  const rowsBox = document.getElementById("tab-filter-rows");
+  if (!rowsBox) return;
+  const total = tabFilterRows.length || 1;
+  rowsBox.innerHTML = tabFilterRows.map((row, idx) => filterRowTemplate(row, idx, total, "")).join("");
+  rowsBox.querySelectorAll(".filter-row").forEach((row) => {
+    const btn = row.querySelector("[data-action=\"filter-remove\"]");
+    if (btn) {
+      if (total <= 1) btn.setAttribute("disabled", "disabled");
+      else btn.removeAttribute("disabled");
+    }
+  });
+}
+
+function handleTabFilterInput(event) {
+  const rowEl = event.target.closest(".filter-row");
+  if (!rowEl) return;
+  const index = Number(rowEl.dataset.index);
+  if (!Number.isFinite(index) || !tabFilterRows[index]) return;
+  if (event.target.classList.contains("filter-kind")) {
+    tabFilterRows[index].kind = event.target.value;
+    if (tabFilterRows[index].kind === "status" && !tabFilterRows[index].value) {
+      tabFilterRows[index].value = "online";
+    }
+    renderTabFilterRows();
+    return;
+  }
+  if (event.target.classList.contains("filter-value")) {
+    tabFilterRows[index].value = event.target.value;
+    return;
+  }
+  renderTabFilterRows();
+}
+
+function handleTabFilterClick(event) {
+  if (event.target.dataset.action !== "filter-remove") return;
+  const rowEl = event.target.closest(".filter-row");
+  if (!rowEl) return;
+  const index = Number(rowEl.dataset.index);
+  if (!Number.isFinite(index) || tabFilterRows.length <= 1) return;
+  tabFilterRows.splice(index, 1);
+  renderTabFilterRows();
+}
+
+function buildFiltersFromRows(rows) {
+  const filters = {};
+  rows.forEach((row) => {
+    if (row.kind === "sensor") {
+      const value = (row.value || "").trim().toLowerCase();
+      if (value) {
+        filters.sensorQuery = filters.sensorQuery ? `${filters.sensorQuery} ${value}` : value;
+      }
+    } else if (row.kind === "status") {
+      if (row.value === "online") {
+        filters.online = true;
+        filters.offline = false;
+      } else if (row.value === "offline") {
+        filters.offline = true;
+        filters.online = false;
+      } else if (row.value === "has_fuel") {
+        filters.hasFuel = true;
+      }
+    }
+  });
+  return filters;
+}
+function adjustScrollTop(scrollTop) {
+  if (!cardVisible || expandedIndex == null || cardHeight <= 0) {
+    return scrollTop;
+  }
+  const cardTop = (expandedIndex + 1) * ROW_H + CARD_ANCHOR_OFFSET;
+  if (scrollTop <= cardTop) {
+    return scrollTop;
+  }
+  const past = Math.min(scrollTop - cardTop, cardHeight);
+  return scrollTop - past;
+}

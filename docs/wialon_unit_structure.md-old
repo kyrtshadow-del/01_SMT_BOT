@@ -1,0 +1,72 @@
+﻿# Wialon Unit Card Structure
+
+This document captures the sections and fields present in a Wialon unit "card" (.wlp export) and will be used as a blueprint for the unified UnitConfig model.
+
+## Top-level keys
+- `type` – object type (`avl_unit`).
+- `version` – export schema version (e.g. `b4`).
+- `mu` – measurement-unit preset ID.
+- `general` – base info (name, unique IDs, phones, password, hardware).
+- `icon` – monitoring icon metadata.
+- `hwConfig` – tracker configuration parameters and flags.
+- `counters` – mileage/fuel/engine counters.
+- `advProps` – advanced monitoring options (primary sensor IDs, color schemes, speed source, etc.).
+- `profile` – arbitrary custom fields defined by the operator.
+- `intervals` – message/notification interval presets.
+- `sensors` – list of sensors with full metadata (type, units, calibration tables, validation rules, formulas).
+- `reportProps` – defaults for reports (speed limits, tolerances, consumption rates).
+- `aliases` – alternative names per locale.
+- `driving`, `trip` – trip detection and GPS correction parameters.
+
+## Section details
+
+### `general`
+Keys observed: `n` (name), `uid`, `uid2`, `ph`, `ph2`, `psw`, `hw`. Provides the base identity of a unit.
+
+### `icon`
+Fields: `lib`, `url`, `imgRot`. Describe which marker icon is used in monitoring.
+
+### `hwConfig`
+- `hw`: hardware profile name.
+- `fullData`: flag indicating whether tracker exposes extended parameters.
+- `params`: list of tracker parameters. Each element contains `name`, `label`, `type`, `value`, `description`, `readonly`, `minval`, `maxval`. These represent device-specific toggles (e.g. skip messages, ibutton options).
+
+### `sensors`
+Each sensor entry contains common keys:
+- `id`, `n` (name), `t` (type code), `m` (units), `d` (description), `p`/`f`/`c` – formula/processing parameters, `vt`/`vs` validation configuration, `tbl` calibration table, `ct`/`mt` timestamps, `flags`.
+- **Type-specific fields**: depending on `t` (fuel level, temperature, digital input, expression, counter, etc.) additional keys appear (`split`, `ignore_invalid`, `din`, `on_value`, `precision`, `logic`, `accumulate`, etc.). Our schema must keep a flexible `meta` object so no data is lost.
+- **Calibration tables**: `tbl` stores an array of `{x, y}` pairs (raw → engineering). Wialon UI allows table editing, CSV import/export, and formula modes (`X a b`). We must persist both raw points and the chosen formula settings.
+- **Measurement units**: `m` points to localized units; values may change based on user presets. Store both the code and the display string when importing.
+- **Validation**: `vt` (validation type), `vs` (source) plus optional bounds/hysteresis determine whether a reading is accepted. Some sensors also have software filtering (`filter`, `avg`, `hyst`).
+- **Import/export**: `.wlp` already serializes sensors; Wialon also supports CSV import. For interoperability we should allow conversion from `.wlp` JSON to our schema and back, preserving calibration tables and type-specific options.
+
+### `counters`
+Observed keys: `cfl`, `cnm`, `cneh`, `cnkb` representing current totals (fuel level, mileage, engine hours, CAN counters). Treat as numeric fields with units derived from MU settings.
+
+### `advProps`
+Stores monitoring behaviour: primary sensor IDs (`monitoring_sensor`, `track_sensor`, `motion_state_sensor_id`), color schemes (`sensors_colors`, `trip_colors`, `solid_colors`), speed source selection, label colors, etc. The set may expand; keep it as key-value map.
+
+### `profile`
+List of custom fields (`id`, `n`, `v`, `ct`, `mt`). Used for free-form metadata (e.g. division, driver). Should support arbitrary count and value types.
+
+### `intervals`
+List of interval presets. Fields: `id`, `n`, `t`, `im/it/ie` (message intervals), `pm/pt/pe` (period settings), `c` (color), `ct`, `mt`. They control how often unit sends data or how notifications behave.
+
+### `reportProps`
+Defaults for analytic reports: `speedLimit`, `maxMessagesInterval`, `dailyEngineHoursRate`, `urbanMaxSpeed`, `mileageCoefficient`, `fuelRateCoefficient`, `speedingTolerance`, `speedingMinDuration`, `speedingMode`, `driver_activity`, `fuelConsRates`, etc.
+
+### `aliases`
+List of alternative names per locale (`id`, `n`, `c`, `l`, `p`, `a`).
+
+### `driving` / `trip`
+Trip detection and GPS correction settings: `type`, `gpsCorrection`, `minSat`, `minMovingSpeed`, `minStayTime`, `maxMessagesDistance`, `minTripTime`, `minTripDistance`.
+
+---
+This structure is the baseline for our `UnitConfig` model. Every section should be mapped 1:1 so that we can import configs from Wialon, edit them locally, and later populate them from other telemetry platforms without losing detail.
+### Sensor parameters (expressions & conversions)
+
+- **Expression parameters** – sensors can compute values using message parameters (param_name), other sensor values ({sensor_name}), constants, math functions (min, max, vg, etc.). Supported operators: arithmetic (+ - * /), power, comparisons, logical AND/OR, ternary condition ? A : B. Sensors may chain expressions (a fuel sensor referencing a filtered sensor) – evaluation order matters.
+- **Parameter conversion** – raw protocol data is transformed via multipliers, divisors, offsets, power-of-two scaling, bit extraction. p1…pN fields define these conversions; the meaning depends on sensor type (voltage, temperature, counter, CAN parameter).
+- **Signed conversion** – trackers sometimes send signed values in unsigned registers; Wialon provides checkboxes/conversion macros (MSB detection and subtraction of 2^N). These flags must be stored so offline calculations match.
+- **Bitwise control** – digital/bitfield sensors use masks and shifts (&, |, ^, <<, >>) to decode individual bits (door status, engine states). Configs may include enumerations mapping bit patterns to textual states.
+- **Validation & chaining** – after expression/conversion the result passes validation (min/max, hysteresis). Sensors can rely on other sensors, so we need dependency handling and to honor quality/invalid flags.

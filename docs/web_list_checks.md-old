@@ -1,0 +1,75 @@
+## 2025-11-18: фиксация списка объектов (fixed-height virtual list)
+
+Этапы и проверки:
+- [x] CSS: сделал фиксированную высоту строки 64px, задал `white-space: nowrap; text-overflow: ellipsis` для имени/мета, чтобы высота была стабильной.
+- [x] JS: переписал виртуализацию на фиксированную высоту `ROW_HEIGHT=64`, пул строк создаётся один раз по размеру viewport (MIN_POOL=32, MAX_POOL=140), без пересоздания на каждом скролле; рендер идёт через `transform` на индекс * ROW_HEIGHT.
+- [x] Scroll reset: при смене фильтра/поиска сбрасываю `scrollTop` в 0, чтобы хвост списка всегда достижим после пересчёта данных.
+- [x] Smoke (локальный, Playwright + моковый API на 500 объектов):
+  - Стартует простой HTTP-сервер, отдающий статические файлы и /api/units.
+  - Скролл до конца (`scrollTop = scrollHeight`) показывает в видимых строках id ~ последний (>= 480).
+  - Скролл обратно вверх возвращает id 1/2 без дерганий.
+  - Результат: `SMOKE OK` (см. команду ниже).
+
+Команда смоука (для повторения):
+```bash
+node - <<'NODE'
+const { chromium } = require('playwright');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const root = process.cwd();
+const PORT = 8123;
+
+// простейший HTTP с моками
+const server = http.createServer((req, res) => {
+  if (req.url.startsWith('/api/units/')) {
+    const id = Number(req.url.split('/').pop());
+    res.writeHead(200, {'Content-Type':'application/json'});
+    return res.end(JSON.stringify({id, name:`Unit ${id}`, online:true, has_fuel: id%3===0, hw:'hw', speed:50, lat:55+id*1e-4, lon:37+id*1e-4}));
+  }
+  if (req.url === '/api/units') {
+    const arr = Array.from({length:500}, (_,i)=>({id:i+1,name:`Unit ${i+1}`,online:i%2===0,has_fuel:i%3===0,hw:'hw',speed:40,lat:55+i*1e-4,lon:37+i*1e-4}));
+    res.writeHead(200, {'Content-Type':'application/json'});
+    return res.end(JSON.stringify(arr));
+  }
+  if (req.url === '/api/worklist') {
+    res.writeHead(200, {'Content-Type':'application/json'}); return res.end('[]');
+  }
+  // статика
+  let file = req.url.split('?')[0];
+  if (file === '/' || file === '/monitoring' || file === '/index') file = '/templates/index.html';
+  const filePath = path.join(root, file.startsWith('/static') ? `web${file}` : `web${file}`);
+  fs.readFile(filePath, (err, data) => {
+    if (err) { res.writeHead(404); return res.end('nf'); }
+    const ext = path.extname(filePath);
+    const map = {'.html':'text/html','.js':'text/javascript','.css':'text/css'};
+    res.writeHead(200, {'Content-Type': map[ext] || 'application/octet-stream'});
+    res.end(data);
+  });
+});
+
+(async() => {
+  await new Promise(r => server.listen(PORT, r));
+  const browser = await chromium.launch({headless:true});
+  const page = await browser.newPage({viewport:{width:1280,height:800}});
+  try {
+    await page.goto(`http://localhost:${PORT}/templates/index.html`, {waitUntil:'networkidle'});
+    await page.waitForSelector('#unit-list');
+    // вниз
+    await page.evaluate(() => { const el = document.getElementById('unit-list'); el.scrollTop = el.scrollHeight; });
+    await page.waitForTimeout(200);
+    const maxId = await page.evaluate(() => Math.max(...Array.from(document.querySelectorAll('.unit-item')).map(e => Number(e.dataset.id || 0))));
+    if (maxId < 480) throw new Error('Не виден хвост списка');
+    // вверх
+    await page.evaluate(() => { const el = document.getElementById('unit-list'); el.scrollTop = 0; });
+    await page.waitForTimeout(200);
+    const minId = await page.evaluate(() => Math.min(...Array.from(document.querySelectorAll('.unit-item')).map(e => Number(e.dataset.id || 99999))));
+    if (minId > 5) throw new Error('Вверху не виден первый блок');
+    console.log('SMOKE OK');
+  } finally {
+    await browser.close();
+    server.close();
+  }
+})();
+NODE
+```

@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cfbot.local/schemas/unit_config.json",
+  "title": "UnitConfig",
+  "type": "object",
+  "required": ["unit_id", "source_kind"],
+  "properties": {
+    "unit_id": { "type": "integer" },
+    "source_kind": { "type": "string" },
+    "dump_ts": { "type": "integer" },
+    "general": { "$ref": "#/$defs/GeneralConfig" },
+    "icon": { "$ref": "#/$defs/IconConfig" },
+    "hw_config": { "$ref": "#/$defs/HWConfig" },
+    "counters": { "$ref": "#/$defs/CounterConfig" },
+    "advanced": { "type": "object", "additionalProperties": {} },
+    "profile": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ProfileField" }
+    },
+    "intervals": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/IntervalConfig" }
+    },
+    "sensors": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/SensorConfig" }
+    },
+    "report_props": { "type": "object", "additionalProperties": {} },
+    "aliases": {
+      "type": "array",
+      "items": { "type": "object", "additionalProperties": {} }
+    },
+    "driving": { "type": "object", "additionalProperties": {} },
+    "trip": { "type": "object", "additionalProperties": {} },
+    "extra": { "type": "object", "additionalProperties": {} }
+  },
+  "$defs": {
+    "GeneralConfig": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "uid": { "type": "string" },
+        "uid2": { "type": "string" },
+        "phone": { "type": "string" },
+        "phone2": { "type": "string" },
+        "password": { "type": "string" },
+        "hardware": { "type": "string" },
+        "extra": { "type": "object", "additionalProperties": {} }
+      }
+    },
+    "IconConfig": {
+      "type": "object",
+      "properties": {
+        "library": { "type": "string" },
+        "url": { "type": "string" },
+        "rotation_mode": { "type": "string" },
+        "extra": { "type": "object", "additionalProperties": {} }
+      }
+    },
+    "HWConfig": {
+      "type": "object",
+      "properties": {
+        "hardware": { "type": "string" },
+        "full_data": { "type": "boolean" },
+        "params": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/HWParam" }
+        },
+        "extra": { "type": "object", "additionalProperties": {} }
+      }
+    },
+    "HWParam": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "label": { "type": "string" },
+        "type": { "type": "string" },
+        "value": {},
+        "default": {},
+        "description": { "type": "string" },
+        "readonly": { "type": "boolean" },
+        "minval": { "type": "number" },
+        "maxval": { "type": "number" },
+        "extra": { "type": "object", "additionalProperties": {} }
+      }
+    },
+    "CounterConfig": {
+      "type": "object",
+      "properties": {
+        "values": { "type": "object", "additionalProperties": { "type": "number" } }
+      }
+    },
+    "ProfileField": {
+      "type": "object",
+      "required": ["field_id", "name", "value"],
+      "properties": {
+        "field_id": { "type": "integer" },
+        "name": { "type": "string" },
+        "value": {},
+        "meta": { "type": "object", "additionalProperties": {} }
+      }
+    },
+    "IntervalConfig": {
+      "type": "object",
+      "required": ["interval_id", "name"],
+      "properties": {
+        "interval_id": { "type": "integer" },
+        "name": { "type": "string" },
+        "params": { "type": "object", "additionalProperties": {} }
+      }
+    },
+    "SensorConfig": {
+      "type": "object",
+      "required": ["sensor_id", "name", "type"],
+      "properties": {
+        "sensor_id": { "type": "integer" },
+        "name": { "type": "string" },
+        "type": { "type": "string" },
+        "units": { "type": "string" },
+        "description": { "type": "string" },
+        "parameters": { "type": "object", "additionalProperties": {} },
+        "expression": { "type": "string" },
+        "validation": { "$ref": "#/$defs/SensorValidation" },
+        "calibration": { "$ref": "#/$defs/SensorCalibration" },
+        "meta": { "type": "object", "additionalProperties": {} }
+      }
+    },
+    "SensorValidation": {
+      "type": "object",
+      "properties": {
+        "mode": { "type": "string" },
+        "min_value": { "type": "number" },
+        "max_value": { "type": "number" },
+        "hysteresis": { "type": "number" },
+        "params": { "type": "object", "additionalProperties": {} }
+      }
+    },
+    "SensorCalibration": {
+      "type": "object",
+      "required": ["sensor_id"],
+      "properties": {
+        "sensor_id": { "type": "integer" },
+        "tank_id": { "type": "string" },
+        "points": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/CalibrationPoint" }
+        },
+        "segments": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/CalibrationSegment" }
+        },
+        "smoothing": { "type": "object", "additionalProperties": {} },
+        "source": { "type": "string" },
+        "updated_at": { "type": "integer" },
+        "meta": { "type": "object", "additionalProperties": {} }
+      }
+    },
+    "CalibrationPoint": {
+      "type": "object",
+      "required": ["raw", "value"],
+      "properties": {
+        "raw": { "type": "number" },
+        "value": { "type": "number" }
+      }
+    },
+    "CalibrationSegment": {
+      "type": "object",
+      "required": ["start_x", "a", "b"],
+      "properties": {
+        "start_x": { "type": "number" },
+        "a": { "type": "number" },
+        "b": { "type": "number" }
+      }
+    }
+  },
+  "additionalProperties": false
+}

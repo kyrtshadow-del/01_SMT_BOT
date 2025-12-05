@@ -1,0 +1,201 @@
+"""Status helpers for Monitoring (shared between web and bot layers)."""
+
+from __future__ import annotations
+
+import os
+import time
+from typing import Any, Dict, Optional
+
+
+DEFAULT_ONLINE_THRESHOLD_SEC = 600  # 10 minutes
+DEFAULT_VOLTAGE_DELTA = 1.0  # минимальный разрыв между «вкл»/«выкл» по напряжению
+DEFAULT_VOLTAGE_ON = 12.2
+DEFAULT_VOLTAGE_OFF = 11.8
+DEFAULT_STOP_TO_PARK_SEC = 900  # 15 минут
+
+
+def _online_threshold() -> int:
+    try:
+        return int(os.getenv("MONITORING_ONLINE_SEC", DEFAULT_ONLINE_THRESHOLD_SEC))
+    except (TypeError, ValueError):
+        return DEFAULT_ONLINE_THRESHOLD_SEC
+
+
+def get_online_threshold() -> int:
+    """Expose the effective online threshold for diagnostics/UI."""
+
+    return _online_threshold()
+
+
+def is_online(last_ts: Optional[int], *, now: Optional[int] = None) -> bool:
+    if last_ts is None:
+        return False
+    try:
+        last_ts = int(last_ts)
+    except (TypeError, ValueError):
+        return False
+    if now is None:
+        now = int(time.time())
+    return now - last_ts <= _online_threshold()
+
+
+def infer_has_fuel(snapshot: Dict[str, Any], unit_config: Optional[Dict[str, Any]] = None) -> bool:
+    # Prefer UnitConfig sensors if supplied; else fall back to snapshot sensors
+    sensors = []
+    if unit_config and isinstance(unit_config.get("sensors"), list):
+        sensors = unit_config["sensors"]
+    elif isinstance(snapshot.get("sensors"), list):
+        sensors = snapshot["sensors"]
+    elif isinstance(snapshot.get("sens"), list):
+        sensors = snapshot["sens"]
+    for s in sensors:
+        s_type = str(s.get("type") or s.get("t") or "").lower()
+        name = str(s.get("name") or s.get("n") or "").lower()
+        if "fuel" in s_type or "дут" in s_type or "fuel" in name or "дут" in name:
+            return True
+    return False
+
+
+def derive_ignition(params: Dict[str, Any], advanced: Optional[Dict[str, Any]] = None) -> Optional[bool]:
+    """Heuristic ignition detection similar to Wialon, без прямого использования скорости как состояния.
+
+    Приоритет: acc/ign → dev_status бит → inputs бит → ручные пороги по напряжению → авто‑порог по напряжению.
+    Скорость используется только для кластеризации при авто‑пороге, но не для прямого решения.
+    """
+
+    def _to_int(val):
+        if isinstance(val, bool):
+            return int(val)
+        if isinstance(val, (int, float)):
+            return int(val)
+        if isinstance(val, str) and val.strip().isdigit():
+            return int(val.strip())
+        return None
+
+    adv = advanced or {}
+
+    acc = _to_int(params.get("acc_trigger") or params.get("ignition") or params.get("ign"))
+    if acc is not None:
+        return bool(acc)
+
+    dev_status = _to_int(params.get("dev_status"))
+    if dev_status is not None:
+        # Wialon часто использует младший бит dev_status как "ignition"
+        return bool(dev_status & 0x1)
+
+    # inputs_status: allow choosing bit via env IGNITION_INPUT_BIT (0-based)
+    inputs = _to_int(params.get("inputs_status"))
+    if inputs is not None:
+        bit_idx = adv.get("ignition_input_bit")
+        if bit_idx is None:
+            try:
+                bit_idx = int(os.getenv("IGNITION_INPUT_BIT", "-1"))
+            except ValueError:
+                bit_idx = -1
+        if isinstance(bit_idx, (int, float)) and bit_idx >= 0:
+            return bool(inputs & (1 << int(bit_idx)))
+
+    # voltage heuristic (ручные пороги, если заданы)
+    pwr_ext = params.get("pwr_ext")
+    try:
+        pwr_ext = float(pwr_ext) if pwr_ext is not None else None
+    except Exception:
+        pwr_ext = None
+
+    v_on = adv.get("ignition_threshold_v_on")
+    v_off = adv.get("ignition_threshold_v_off")
+    if v_on is not None and v_off is not None and pwr_ext is not None:
+        try:
+            v_on = float(v_on)
+            v_off = float(v_off)
+            if pwr_ext >= v_on:
+                return True
+            if pwr_ext <= v_off:
+                return False
+        except Exception:
+            pass
+
+    # авто-порог по напряжению вычисляется вне (в веб-слое) — здесь только None
+    return None
+
+
+def compute_status(
+    snapshot: Dict[str, Any],
+    latest: Dict[str, Any],
+    unit_config: Optional[Dict[str, Any]] = None,
+    *,
+    now: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Returns a compact status dict used by web Monitoring.
+    Keys: online, status, status_label, speed, last_ts, has_fuel.
+    """
+
+    last_ts = latest.get("device_ts") or latest.get("received_ts") or snapshot.get("t")
+    online = is_online(last_ts, now=now)
+    speed = latest.get("speed")
+    try:
+        spd = float(speed) if speed is not None else 0.0
+    except (TypeError, ValueError):
+        spd = 0.0
+    advanced = unit_config.get("advanced") if isinstance(unit_config, dict) else None
+    ignition = derive_ignition({**latest, **_extract_params(latest)}, advanced=advanced)
+    params = _extract_params(latest)
+    stop_duration = (
+        params.get("stop_duration_s")
+        or params.get("stop_dur")
+        or latest.get("stop_duration_s")
+        or latest.get("stop_dur")
+    )
+    try:
+        if stop_duration is not None:
+            stop_duration = float(stop_duration)
+    except Exception:
+        stop_duration = None
+    try:
+        stop_threshold = int(os.getenv("STOP_TO_PARK_SEC", DEFAULT_STOP_TO_PARK_SEC))
+    except Exception:
+        stop_threshold = DEFAULT_STOP_TO_PARK_SEC
+    status = "offline"
+    if online:
+        if spd >= 1.0:
+            status = "moving"
+        else:
+            if stop_duration is not None and stop_duration < stop_threshold:
+                status = "stop"
+            else:
+                if ignition is True:
+                    status = "park_ign_on"
+                elif ignition is False:
+                    status = "park_ign_off"
+                else:
+                    status = "stopped"
+    status_label = {
+        "moving": "Движение",
+        "stop": "Остановка",
+        "park_ign_on": "Стоянка, зажиг. вкл",
+        "park_ign_off": "Стоянка, зажиг. выкл",
+        "stopped": "Стоянка",
+        "offline": "Нет связи",
+    }.get(status, status)
+    has_fuel = infer_has_fuel(snapshot, unit_config)
+
+    return {
+        "online": online,
+        "status": status,
+        "status_label": status_label,
+        "speed": speed,
+        "last_ts": last_ts,
+        "has_fuel": has_fuel,
+        "ignition": ignition,
+    }
+
+
+def _extract_params(latest: Dict[str, Any]) -> Dict[str, Any]:
+    params = latest.get("params") or latest.get("prms")
+    if isinstance(params, dict):
+        return params
+    return {}
+
+
+__all__ = ["compute_status", "is_online", "infer_has_fuel", "get_online_threshold"]

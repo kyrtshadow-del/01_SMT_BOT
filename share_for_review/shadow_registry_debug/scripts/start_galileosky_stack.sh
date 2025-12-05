@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# One-button launcher for Galileosky: cleans occupied ports, restarts tunnel and stream.
+# Usage (adjust env as needed):
+#   TUNNEL_HOST=1.2.3.4 TUNNEL_USER=root ./scripts/start_galileosky_stack.sh
+#
+# Optional env:
+#   LOCAL_PORT        (default 8088)  – where galileosky listener runs locally
+#   REMOTE_PORT       (default 8088)  – remote port on VPS (ssh -R REMOTE_PORT:localhost:LOCAL_PORT)
+#   WIALON_IPS_PORT   (default 18081) – local port for Wialon IPS listener
+#   WIALON_IPS_REMOTE (default 18081) – remote port for Wialon IPS (ssh -R)
+#   TUNNEL_SSH_PORT   (default 22)
+#   RUN_UNITS         (default "cached") – arg for run_stream
+#   NO_BOT            (set to 1 to skip bot)
+#   NO_SNAPSHOT       (set to 1 to disable snapshot loop)
+#   NO_WIALON         (set to 1 to skip Wialon IPS listener/tunnel)
+#   IPS_MAX_FUTURE_SEC (default 14400) - max future time tolerance for IPS
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOG_DIR="${ROOT}/logs"
+mkdir -p "${LOG_DIR}"
+
+# Load .env if present (helps to pass REDIS_URL/DEVICE_REGISTRY_* without exporting each time)
+if [[ -f "${ROOT}/.env" ]]; then
+  echo "[stack] loading ${ROOT}/.env (errors ignored)"
+  set -a
+  # shellcheck disable=SC1090
+  ( set +e; source "${ROOT}/.env" >/dev/null 2>&1 || true )
+  set +a
+fi
+
+LOCAL_PORT="${LOCAL_PORT:-8088}"
+REMOTE_PORT="${REMOTE_PORT:-8088}"
+WIALON_IPS_PORT="${WIALON_IPS_PORT:-18081}"
+WIALON_IPS_REMOTE="${WIALON_IPS_REMOTE:-18081}"
+TUNNEL_HOST="${TUNNEL_HOST:-}"
+TUNNEL_USER="${TUNNEL_USER:-root}"
+TUNNEL_SSH_PORT="${TUNNEL_SSH_PORT:-22}"
+RUN_UNITS="${RUN_UNITS:-cached}"
+NO_BOT="${NO_BOT:-0}"
+NO_SNAPSHOT="${NO_SNAPSHOT:-0}"
+NO_WIALON="${NO_WIALON:-0}"
+WEB_PORT="${WEB_PORT:-8080}"
+NO_WEB="${NO_WEB:-0}"
+IPS_MAX_FUTURE_SEC="${IPS_MAX_FUTURE_SEC:-14400}"
+DEVICE_REGISTRY_ENABLED="${DEVICE_REGISTRY_ENABLED:-0}"
+DEVICE_REGISTRY_DSN="${DEVICE_REGISTRY_DSN:-}"
+REDIS_URL="${REDIS_URL:-}"
+SKIP_TUNNEL="${SKIP_TUNNEL:-0}"
+START_INFRA="${START_INFRA:-0}"
+
+# Auto-fallback to local mode if tunnel host not provided
+if [[ -z "${TUNNEL_HOST}" && "${SKIP_TUNNEL}" != "1" ]]; then
+  echo "[stack] TUNNEL_HOST not set -> running in local mode (SKIP_TUNNEL=1)" >&2
+  SKIP_TUNNEL=1
+fi
+
+kill_pidfile() {
+  local pidfile="$1"
+  if [[ -f "${pidfile}" ]]; then
+    local pid
+    pid="$(cat "${pidfile}" 2>/dev/null || true)"
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      echo "  -> killing PID ${pid} from ${pidfile}"
+      kill "${pid}" || true
+    fi
+    rm -f "${pidfile}"
+  fi
+}
+
+kill_by_cmd() {
+  local pattern="$1"
+  echo "  -> looking for processes matching '${pattern}'"
+  if command -v pkill >/dev/null 2>&1; then
+    pkill -f "${pattern}" || true
+  else
+    ps ax | grep "${pattern}" | grep -v grep | awk '{print $1}' | xargs -r kill || true
+  fi
+}
+
+kill_port_process() {
+  local port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -ti tcp:"${port}" | xargs -r kill || true
+  elif command -v fuser >/dev/null 2>&1; then
+    fuser -k "${port}"/tcp 2>/dev/null || true
+  fi
+}
+
+ensure_port_free() {
+  local port="$1"
+  local retries=10
+  echo "[stack] ensuring port ${port} is free..."
+  for ((i=0; i<retries; i++)); do
+    if command -v ss >/dev/null 2>&1; then
+      if ! ss -lptn "sport = :${port}" | grep -q ":${port}"; then
+        return 0
+      fi
+    elif command -v netstat >/dev/null 2>&1; then
+      if ! netstat -tulpn | grep -q ":${port} "; then
+        return 0
+      fi
+    else
+      return 0
+    fi
+    echo "  -> port ${port} is still in use. Sending kill signal..."
+    kill_port_process "${port}"
+    sleep 1
+  done
+  echo "  -> port ${port} stuck. Trying SIGKILL..."
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -ti tcp:"${port}" | xargs -r kill -9 || true
+  fi
+  sleep 1
+  if command -v ss >/dev/null 2>&1; then
+     if ss -lptn "sport = :${port}" | grep -q ":${port}"; then
+       echo "ERROR: Could not free port ${port}. Please check manually."
+       exit 1
+     fi
+  fi
+}
+
+# --- CLEANUP PHASE ---
+
+echo "[stack] stopping previous processes..."
+
+kill_pidfile "${LOG_DIR}/autossh_galileosky.pid"
+kill_pidfile "${LOG_DIR}/run_all_galileosky.pid"
+
+kill_by_cmd "pipeline/cli/run_stream.py"
+kill_by_cmd "pipeline/cli/run_all.py"
+kill_by_cmd "bot_new.py"
+kill_by_cmd "uvicorn pipeline.api.web_app:app"
+
+ensure_port_free "${LOCAL_PORT}"
+if [[ "${NO_WIALON}" != "1" ]]; then
+  ensure_port_free "${WIALON_IPS_PORT}"
+fi
+ensure_port_free "${WEB_PORT}"
+
+echo "[stack] cleanup complete. Ports are free."
+
+# --- STARTUP PHASE ---
+
+# Optional: start local infra (postgres+redis) via docker compose
+if [[ "${START_INFRA}" == "1" ]]; then
+  if command -v docker >/dev/null 2>&1; then
+    COMPOSE_CMD=(docker compose)
+  elif command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE_CMD=(docker-compose)
+  else
+    echo "[stack] START_INFRA=1 requested, but docker compose is not installed" >&2
+    exit 1
+  fi
+  echo "[stack] starting infra via docker compose (redis + postgres)"
+  (cd "${ROOT}" && "${COMPOSE_CMD[@]}" up -d redis postgres)
+fi
+
+if [[ "${SKIP_TUNNEL}" != "1" ]]; then
+  if [[ -z "${TUNNEL_HOST}" ]]; then
+     echo "ERROR: TUNNEL_HOST is required unless SKIP_TUNNEL=1" >&2
+     exit 1
+  fi
+  echo "[stack] cleaning remote port ${REMOTE_PORT} on ${TUNNEL_HOST}"
+  ssh -p "${TUNNEL_SSH_PORT}" "${TUNNEL_USER}@${TUNNEL_HOST}" "fuser -k ${REMOTE_PORT}/tcp 2>/dev/null || true" || true
+  if [[ "${NO_WIALON}" != "1" ]]; then
+    echo "[stack] cleaning remote wialon port ${WIALON_IPS_REMOTE} on ${TUNNEL_HOST}"
+    ssh -p "${TUNNEL_SSH_PORT}" "${TUNNEL_USER}@${TUNNEL_HOST}" "fuser -k ${WIALON_IPS_REMOTE}/tcp 2>/dev/null || true" || true
+  fi
+  echo "[stack] starting autossh tunnel"
+  AUTOSSH_LOGFILE="${LOG_DIR}/autossh_galileosky.log"
+  AUTOSSH_PIDFILE="${LOG_DIR}/autossh_galileosky.pid"
+  AUTOSSH_POLL=30 AUTOSSH_GATETIME=10 AUTOSSH_LOGLEVEL=1 \
+    nohup autossh -M 0 -N \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=3 \
+      -p "${TUNNEL_SSH_PORT}" \
+      -R "0.0.0.0:${REMOTE_PORT}:localhost:${LOCAL_PORT}" \
+      $( [[ "${NO_WIALON}" != "1" ]] && printf -- '-R 0.0.0.0:%s:localhost:%s' "${WIALON_IPS_REMOTE}" "${WIALON_IPS_PORT}" ) \
+      "${TUNNEL_USER}@${TUNNEL_HOST}" \
+      >>"${AUTOSSH_LOGFILE}" 2>&1 &
+  echo $! > "${AUTOSSH_PIDFILE}"
+else
+  echo "[stack] SKIP_TUNNEL=1 set: skipping autossh and remote port cleanup"
+fi
+
+PYTHON_BIN="${ROOT}/.venv/bin/python"
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  PYTHON_BIN="$(command -v python3)"
+fi
+
+echo "[stack] starting run_all (bot+stream+snapshot)"
+RUNALL_LOGFILE="${LOG_DIR}/run_all_galileosky.log"
+RUNALL_PIDFILE="${LOG_DIR}/run_all_galileosky.pid"
+if [[ "${NO_WIALON}" == "1" ]]; then
+  SOURCE_ENV=(PIPELINE_SOURCE_KIND=galileosky)
+else
+  SOURCE_ENV=(PIPELINE_SOURCE_LIST="galileosky,wialon_ips" PIPELINE_WIALON_IPS_PORT="${WIALON_IPS_PORT}")
+fi
+cmd=(env "${SOURCE_ENV[@]}" PIPELINE_GALILEOSKY_PORT="${LOCAL_PORT}" IPS_MAX_FUTURE_SEC="${IPS_MAX_FUTURE_SEC}")
+[[ -n "${REDIS_URL}" ]] && cmd+=(REDIS_URL="${REDIS_URL}")
+[[ "${DEVICE_REGISTRY_ENABLED}" == "1" ]] && cmd+=(DEVICE_REGISTRY_ENABLED=1)
+[[ -n "${DEVICE_REGISTRY_DSN}" ]] && cmd+=(DEVICE_REGISTRY_DSN="${DEVICE_REGISTRY_DSN}")
+[[ "${NO_SNAPSHOT}" == "1" ]] && cmd+=(SNAPSHOT_INTERVAL_SEC=0)
+[[ "${NO_WEB}" == "1" ]] && cmd+=(NO_WEB=1) || cmd+=(WEB_PORT="${WEB_PORT}")
+cmd+=(PYTHONPATH=. "${PYTHON_BIN}" pipeline/cli/run_all.py --units "${RUN_UNITS}")
+[[ "${NO_BOT}" == "1" ]] && cmd+=(--no-bot)
+[[ "${NO_WEB}" == "1" ]] && cmd+=(--no-web)
+[[ "${NO_SNAPSHOT}" == "1" ]] && cmd+=(--no-snapshot)
+
+echo "  -> cmd: ${cmd[*]}"
+nohup "${cmd[@]}" >>"${RUNALL_LOGFILE}" 2>&1 &
+echo $! > "${RUNALL_PIDFILE}"
+
+echo "[stack] started successfully (PID $(cat ${RUNALL_PIDFILE}))."
+echo "  Tail logs: tail -f ${RUNALL_LOGFILE} ${LOG_DIR}/wialon_ips_ingest.log"

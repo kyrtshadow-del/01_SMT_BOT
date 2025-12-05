@@ -1,0 +1,968 @@
+// NOTE: This file contains the fixed UI/UX for Monitoring v2 (shadow toggle, history sidebar, arrow rendering)
+
+const MAP_KEY = "smt_map_state_v2";
+const SESSION_KEY = "smt_session_v2";
+const SESSION_INFO_KEY = "smt_session_info_v1";
+const ROW_H = 60;
+const OVERSCAN = 6;
+const MIN_POOL = 40;
+const MAX_POOL = 160;
+const FIXED_CARD_KEYS = ["location"];
+const CARD_SECTIONS = [
+  { key: "sensors", title: "Датчики" },
+  { key: "connectivity", title: "Подключение" },
+  { key: "counters", title: "Счётчики" },
+  { key: "params", title: "Параметры" },
+  { key: "custom_fields", title: "Пользовательские поля" },
+  { key: "crew", title: "Водители" },
+  { key: "nearby", title: "Ближайшие" },
+  { key: "recent_events", title: "Последние сообщения" },
+];
+const CARD_SETTINGS_KEY = "smt_card_sections_v1";
+const CARD_ORDER_KEY = "smt_card_order_v1";
+const DETAIL_CACHE_TTL_MS = 60000;
+const ACTIVE_TAB_KEY = "smt_active_tab_v1";
+const TAB_STATE_KEY = "smt_tab_state_v1";
+const SIDEBAR_WIDTH_KEY = "smt_sidebar_width_v1";
+const RENDER_CARD_KEYS = [...FIXED_CARD_KEYS, ...CARD_SECTIONS.map((s) => s.key)];
+const DEFAULT_CARD_SECTIONS = CARD_SECTIONS.reduce((acc, s) => { acc[s.key] = true; return acc; }, {});
+const DEFAULT_CARD_ORDER = [...RENDER_CARD_KEYS];
+const DEFAULT_TABS = [{ id: "work", name: "Рабочий", filters: { worklist: true } }];
+const FEED_INTERVAL_MS = 10000;
+const SHADOW_API_PATHS = ["/web/api/unknown_devices", "/api/unknown_devices"];
+
+// Global State
+let map, cluster;
+let markerById = new Map();
+let units = [], unitsById = new Map(), worklist = new Set(), current = [];
+let listEl, innerEl, pool = [], poolSize = 0;
+let selectedId = null;
+let modalState = { filtered: [], selected: new Set(), showOnMap: false };
+let isAdmin = false;
+let modalRowById = new Map();
+let tooltipEl, cardEl;
+let cardSettings = loadCardSettings();
+let cardOrder = loadCardOrder();
+let orderRowByKey = new Map();
+let panelTabs = [...DEFAULT_TABS];
+let activeTabId = loadActiveTab();
+let tabState = loadTabState();
+let currentCardDetail = null;
+let panelSettingsReady = false;
+let liveTimer = null, liveInFlight = false;
+let feedSince = null, lastFeedTick = Date.now();
+let sidebarWidth = loadSidebarWidth();
+let resizerPointerId = null;
+let tabFilterRows = [];
+let expandedIndex = null;
+let cardHeight = 0, cardVisible = false, cardNeedsAnchor = false;
+const CARD_GAP = 6, CARD_ANCHOR_OFFSET = 8;
+const DETAIL_CACHE_LIMIT = 300;
+let nearbyCardState = { unitId: null, visible: false, list: [] };
+const detailCache = new Map();
+// Shadow/Inbox
+let mode = "monitor";
+let shadowUnits = [], selectedShadow = null;
+let shadowLayer = null, shadowMarkerByKey = new Map();
+let shadowToggleInFlight = false;
+let shadowDebugSeq = 0;
+// DOM Elements
+let userLabelEl, adminBtn, logoutBtn, shadowToggleBtn;
+let detailPrefetchInFlight = new Set();
+let detailCacheKeys = [];
+let statusPopupsWired = false;
+
+// --- Helpers ---
+function stripIgnitionText(text = "") { return text.replace(/,?\s*зажиг\.?\s*(вкл|выкл)/gi, "").trim(); }
+function formatUid(uid) { if (!uid) return ""; const s = String(uid); return s.length <= 8 ? s : `${s.slice(0, 4)}…${s.slice(-4)}`; }
+function cardSectionTitle(key) { const item = CARD_SECTIONS.find((s) => s.key === key); return item ? item.title : (key === "nearby" ? "Ближайшие" : key); }
+function renderKvGrid(items) {
+  if (!items || !items.length) return "—";
+  return `<div class="kv-grid">${items.map(i => `<div class="kv-pill"><span class="kv-label">${i.label||""}</span><span class="kv-divider"></span><span class="kv-value">${i.value!=null?i.value:"—"}</span></div>`).join("")}</div>`;
+}
+
+function getUnitIconUrl(kind) {
+  const icons = { bus: "bus.svg", van: "van.svg", truck: "truck.svg", tractor: "tractor.svg", combine: "combine.svg", loader: "loader.svg" };
+  return `/static/icons/${icons[kind] || "car.svg"}`;
+}
+
+// --- LocalStorage Config ---
+function loadCardSettings() {
+    try { return JSON.parse(localStorage.getItem(CARD_SETTINGS_KEY)) || { ...DEFAULT_CARD_SECTIONS }; } catch { return { ...DEFAULT_CARD_SECTIONS }; }
+}
+function saveCardSettings() { localStorage.setItem(CARD_SETTINGS_KEY, JSON.stringify(cardSettings)); }
+function loadCardOrder() {
+    try { const arr = JSON.parse(localStorage.getItem(CARD_ORDER_KEY)); if(Array.isArray(arr)) return arr; } catch {}
+    return [...DEFAULT_CARD_ORDER];
+}
+function saveCardOrder(order) { localStorage.setItem(CARD_ORDER_KEY, JSON.stringify(order)); }
+function loadActiveTab() { return localStorage.getItem(ACTIVE_TAB_KEY) || "work"; }
+function loadTabState() { try { return JSON.parse(localStorage.getItem(TAB_STATE_KEY)) || {}; } catch { return {}; } }
+function saveTabState() { localStorage.setItem(TAB_STATE_KEY, JSON.stringify(tabState)); }
+function setTabState(id, p) { if(id) { tabState[id] = { ...tabState[id], ...p }; saveTabState(); } }
+function loadSidebarWidth() { const w = parseInt(localStorage.getItem(SIDEBAR_WIDTH_KEY)); return (w >= 260 && w <= 640) ? w : 380; }
+
+// --- MAIN START ---
+async function main() {
+  tooltipEl = document.getElementById("unit-tooltip");
+  cardEl = document.getElementById("unit-card");
+  userLabelEl = document.getElementById("user-label");
+  adminBtn = document.getElementById("btn-admin");
+  shadowToggleBtn = document.getElementById("btn-shadow");
+  logoutBtn = document.getElementById("btn-logout");
+  
+  if (logoutBtn) logoutBtn.addEventListener("click", logout);
+  if (adminBtn) adminBtn.addEventListener("click", openAdmin);
+  if (shadowToggleBtn) {
+      shadowToggleBtn.addEventListener("click", toggleShadowMode);
+  }
+
+  initHistory();
+  ensureListDom();
+  initMap();
+  initClock();
+  initModal();
+  initTabModalFilters();
+  initLayout();
+  
+  // Init Modals
+  const modals = {
+     "admin-close": "admin-modal", "tab-close": "tab-modal", "tab-cancel": "tab-modal", 
+     "card-settings-close": "card-settings-modal", "card-settings-close-bottom": "card-settings-modal",
+     "trip-close": "trip-modal", "trip-cancel": "trip-modal"
+  };
+  for(const [btnId, modalId] of Object.entries(modals)) {
+      const btn = document.getElementById(btnId);
+      if(btn) btn.addEventListener("click", () => document.getElementById(modalId).classList.add("hidden"));
+  }
+  
+  document.getElementById("btn-add-tab")?.addEventListener("click", openTabModal);
+  document.getElementById("tab-save")?.addEventListener("click", saveTabFromModal);
+  document.getElementById("btn-card-settings")?.addEventListener("click", openCardSettingsModal);
+  document.getElementById("card-settings-reset")?.addEventListener("click", resetCardSettings);
+  document.getElementById("trip-save")?.addEventListener("click", saveTripModal);
+  
+  if (cardEl) cardEl.addEventListener("click", handleCardClick);
+
+  initLoginModal();
+  await ensureSession();
+  
+  // Try load cached session info
+  try {
+    const cached = localStorage.getItem(SESSION_INFO_KEY);
+    if(cached) applySessionInfo(JSON.parse(cached));
+  } catch {}
+  
+  fetchSessionInfo(); // Refresh session info background
+  await fetchPanelSettings();
+  renderTabs();
+  await loadWorklist();
+  await loadUnits({ restartLive: true });
+}
+
+main().catch(e => { console.error(e); setStatus("Ошибка запуска"); });
+
+// --- Auth & Session ---
+async function ensureSession() {
+  let sid = localStorage.getItem(SESSION_KEY);
+  if (!sid) sid = await ensureLoginSession();
+  return sid;
+}
+
+async function authFetch(url, opts = {}) {
+  const sid = await ensureSession();
+  const headers = { ...(opts.headers || {}), "X-Session-Id": sid };
+  return fetch(url, { ...opts, headers });
+}
+
+async function fetchSessionInfo() {
+  try {
+    const res = await authFetch("/web/api/session");
+    if (res.status === 401) { localStorage.removeItem(SESSION_KEY); location.reload(); return; }
+    if (res.ok) {
+        const info = await res.json();
+        localStorage.setItem(SESSION_INFO_KEY, JSON.stringify(info));
+        applySessionInfo(info);
+    }
+  } catch (e) { console.warn("Session check failed", e); }
+}
+
+function applySessionInfo(info) {
+  if (!info) return;
+  isAdmin = !!info.is_admin;
+  if (userLabelEl) userLabelEl.textContent = info.display_name || info.login;
+  // Show admin buttons
+  if (adminBtn) adminBtn.style.display = isAdmin ? "inline-block" : "none";
+  if (shadowToggleBtn) shadowToggleBtn.style.display = isAdmin ? "inline-block" : "none";
+}
+
+// --- Data Loading ---
+async function loadUnits({ restartLive = false } = {}) {
+  const res = await authFetch("/web/api/units");
+  if (!res.ok) throw new Error("API Error " + res.status);
+  units = await res.json();
+  // Cache previews
+  cardPreviewById = new Map();
+  units.forEach(u => {
+      if(u.card_preview) { cardPreviewById.set(u.id, u.card_preview); delete u.card_preview; }
+  });
+  
+  unitsById.clear();
+  units.forEach(u => unitsById.set(u.id, u));
+  
+  // Initial sort
+  units.sort((a, b) => a.name.localeCompare(b.name, "ru", { sensitivity: "base" }));
+  
+  applyFilters();
+  lastFeedTick = Date.now();
+  
+  if (restartLive) {
+     feedSince = null;
+     scheduleLiveUpdates(true);
+  }
+}
+
+function scheduleLiveUpdates(reset = false) {
+  if (reset && liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
+  if (liveTimer) return;
+  liveTimer = setTimeout(fetchLiveUpdates, FEED_INTERVAL_MS);
+}
+
+async function fetchLiveUpdates() {
+  if (liveInFlight) { scheduleLiveUpdates(); return; }
+  liveInFlight = true;
+  try {
+    const watchIds = getWatchIds().slice(0, 400);
+    const qs = [];
+    if (feedSince) qs.push(`since=${feedSince}`);
+    if (watchIds.length) qs.push(`watch_ids=${watchIds.join(",")}`);
+    const url = `/web/api/units/feed${qs.length ? "?"+qs.join("&") : ""}`;
+    const res = await authFetch(url);
+    if (res.ok) {
+        const data = await res.json();
+        lastFeedTick = Date.now();
+        if (typeof data.shadow_count === "number") updateShadowBadge(data.shadow_count);
+        if (data.ts) feedSince = data.ts;
+        if (data.reset) await loadUnits({ restartLive: true });
+        else if (data.updates?.length) applyFeedUpdates(data.updates);
+    }
+  } catch (e) { console.warn("Feed error", e); }
+  finally {
+    liveInFlight = false;
+    liveTimer = null;
+    scheduleLiveUpdates();
+  }
+}
+
+function applyFeedUpdates(updates) {
+  let changed = false;
+  const touched = new Set();
+  updates.forEach(patch => {
+    const u = unitsById.get(patch.id);
+    if (!u) return;
+    touched.add(patch.id);
+    // Merge fields
+    for (const k of ["online", "status", "status_label", "last_ts", "speed", "lat", "lon", "ignition", "has_fuel"]) {
+        if (patch[k] !== undefined && u[k] !== patch[k]) { u[k] = patch[k]; changed = true; }
+    }
+  });
+  if (changed) {
+      applyFilters();
+      if (selectedId && touched.has(selectedId)) refreshCurrentCard();
+  }
+}
+
+// --- Card Rendering ---
+function renderCard(detail) {
+  if (!cardEl) return;
+  const item = detail.item;
+  const status = detail.status_details || {};
+  
+  // Prepare data
+  const statusTxt = status.status_label || "Нет связи";
+  const lastTime = formatRelativeTime(status.last_ts);
+  const statusCls = status.online ? "online" : "offline";
+
+  const sections = [];
+  
+  // Location
+  const addr = detail.card_data?.location?.address || "—";
+  const coords = item.lat ? `${item.lat.toFixed(5)}, ${item.lon.toFixed(5)}` : "—";
+  sections.push({
+      key: "location", title: "Местоположение",
+      html: renderKvGrid([{label: "Адрес", value: addr}, {label: "Координаты", value: coords}])
+  });
+
+  // Sensors
+  if(cardSettings.sensors) {
+      const sens = detail.card_data?.sensors || [];
+      if(sens.length) sections.push({
+          key: "sensors", title: "Датчики",
+          html: renderKvGrid(sens.map(s => ({label: s.name, value: s.value + (s.units ? " "+s.units : "")})))
+      });
+  }
+
+  // Params (filtered)
+  if(cardSettings.params) {
+      const prms = (detail.card_data?.params || []).slice(0, 20);
+      if(prms.length) sections.push({
+          key: "params", title: "Параметры",
+          html: renderKvGrid(prms.map(p => ({label: p.key, value: p.value})))
+      });
+  }
+  
+  // Render
+  const actionsHtml = `
+     <div class="card-actions">
+        <button class="ghost icon" data-action="open-history" title="История">📅</button>
+        <button class="ghost icon" data-action="card-layout-toggle" title="Настройки">⚙️</button>
+        <button class="ghost icon" data-action="card-close" title="Закрыть">✕</button>
+     </div>
+  `;
+  
+  const sectionsHtml = sections.map(s => `
+    <div class="card-block" data-key="${s.key}">
+       <div class="label">${s.title}</div>
+       <div class="card-block-body">${s.html}</div>
+    </div>
+  `).join("");
+
+  cardEl.innerHTML = `
+    <div class="card-head">
+        <div class="card-head-main">
+            <div class="card-head-name">${item.name}</div>
+            <div class="card-head-subtitle">#${item.id} ${item.hw||""}</div>
+        </div>
+        ${actionsHtml}
+    </div>
+    <div class="card-status-row">
+        <span class="card-status-dot ${statusCls}"></span>
+        <div class="card-status-body">
+            <div class="card-status-title">${statusTxt}</div>
+            <div class="card-status-caption">${lastTime}</div>
+        </div>
+    </div>
+    <div class="card-grid">${sectionsHtml}</div>
+  `;
+  
+  cardEl.classList.remove("hidden");
+  selectedId = item.id;
+  currentCardDetail = detail;
+  
+  // Position card relative to row
+  const row = listEl.querySelector(`.unit-row[data-id="${item.id}"]`);
+  if(row) {
+      const top = row.offsetTop + ROW_H + CARD_ANCHOR_OFFSET;
+      cardEl.style.top = top + "px";
+      cardVisible = true;
+      expandedIndex = parseInt(row.dataset.index);
+      innerEl.style.height = (current.length * ROW_H + cardEl.offsetHeight + 20) + "px";
+      
+      // Shift rows below
+      Array.from(innerEl.children).forEach(el => {
+          if(el.classList.contains("unit-row")) {
+             const idx = parseInt(el.dataset.index);
+             let y = idx * ROW_H;
+             if(idx > expandedIndex) y += (cardEl.offsetHeight + CARD_GAP);
+             el.style.transform = `translateY(${y}px)`;
+          }
+      });
+  }
+}
+
+function handleCardClick(e) {
+    const btn = e.target.closest("button");
+    if(!btn) return;
+    const action = btn.dataset.action;
+    if(action === "card-close") hideCard();
+    if(action === "open-history") openHistoryModal(selectedId);
+    if(action === "card-layout-toggle") openCardSettingsModal();
+}
+
+function hideCard() {
+    cardEl.classList.add("hidden");
+    cardVisible = false;
+    expandedIndex = null;
+    renderList(); // Reset row positions
+}
+
+// --- List & Virtual Scroll ---
+function ensureListDom() {
+    listEl = document.getElementById("unit-list");
+    innerEl = listEl.querySelector(".unit-list-inner") || document.createElement("div");
+    innerEl.className = "unit-list-inner";
+    listEl.appendChild(innerEl);
+    innerEl.appendChild(cardEl); // Keep card inside for coordinate system
+    listEl.addEventListener("scroll", () => requestAnimationFrame(renderList));
+    
+    document.getElementById("search").addEventListener("input", applyFilters);
+    document.getElementById("btn-refresh").addEventListener("click", () => loadUnits({restartLive:true}));
+}
+
+function applyFilters() {
+    const q = document.getElementById("search").value.toLowerCase();
+    current = units.filter(u => !q || u.name.toLowerCase().includes(q));
+    
+    renderList();
+    syncMarkers(current);
+    
+    const sEl = document.getElementById("status");
+    if(sEl) sEl.textContent = `Всего: ${units.length} / Отображено: ${current.length}`;
+}
+
+function renderList() {
+    if(!listEl) return;
+    const viewportH = listEl.clientHeight;
+    const scrollY = listEl.scrollTop;
+    
+    // Basic virtualization
+    const startIdx = Math.max(0, Math.floor(scrollY / ROW_H) - OVERSCAN);
+    const endIdx = Math.min(current.length, Math.ceil((scrollY + viewportH) / ROW_H) + OVERSCAN);
+    
+    const cardH = cardVisible ? (cardEl.offsetHeight + CARD_GAP) : 0;
+    innerEl.style.height = (current.length * ROW_H + cardH) + "px";
+    
+    // Clear pool usage
+    pool.forEach(el => el.style.display = 'none');
+    
+    // Ensure pool size
+    while(pool.length < (endIdx - startIdx)) {
+        const el = document.createElement("div");
+        el.className = "unit-row";
+        el.innerHTML = `<div class="unit-name"></div><div class="unit-meta"></div><div class="unit-meta" style="text-align:right"></div>`;
+        el.addEventListener("click", onRowClick);
+        innerEl.appendChild(el);
+        pool.push(el);
+    }
+    
+    let poolIdx = 0;
+    for(let i=startIdx; i<endIdx; i++) {
+        const u = current[i];
+        const el = pool[poolIdx++];
+        el.style.display = 'grid';
+        el.dataset.id = u.id;
+        el.dataset.index = i;
+        
+        let y = i * ROW_H;
+        if(cardVisible && expandedIndex !== null && i > expandedIndex) y += cardH;
+        el.style.transform = `translateY(${y}px)`;
+        el.classList.toggle("is-selected", u.id === selectedId);
+        
+        // Fill data
+        const nameEl = el.children[0];
+        nameEl.textContent = u.name;
+        if(u.online) nameEl.style.color = "#fff"; else nameEl.style.color = "#aaa";
+        
+        const metaEl = el.children[1];
+        metaEl.innerHTML = `<span class="dot ${u.online?'online':'offline'}"></span> ${u.status_label || "—"}`;
+        
+        const speedEl = el.children[2];
+        speedEl.textContent = u.speed > 0 ? Math.round(u.speed)+" км/ч" : "";
+    }
+}
+
+function onRowClick(e) {
+    const id = parseInt(e.currentTarget.dataset.id);
+    selectUnit(id);
+}
+
+// --- Shadow / Inbox ---
+async function toggleShadowMode() {
+    if(mode === "monitor") {
+        mode = "inbox";
+        hideCard();
+        await loadShadowInbox();
+        renderShadowSidebar();
+    } else {
+        mode = "monitor";
+        await loadUnits();
+    }
+}
+
+async function loadShadowInbox() {
+    try {
+        const res = await authFetch("/web/api/unknown_devices");
+        shadowUnits = await res.json();
+        updateShadowBadge(shadowUnits.length);
+    } catch (e) { console.error(e); }
+}
+
+function renderShadowSidebar() {
+    // Reuse list rendering logic or simpler substitution
+    innerEl.innerHTML = ""; // Clear virtualization
+    if (!shadowUnits.length) {
+        innerEl.innerHTML = `<div style="padding:20px;text-align:center;color:#888">Нет новых устройств</div>`;
+        return;
+    }
+    shadowUnits.forEach(u => {
+        const el = document.createElement("div");
+        el.className = "shadow-row"; // CSS class needed
+        el.innerHTML = `
+            <div class="shadow-uid">${u.uid}</div>
+            <div class="shadow-proto">${u.protocol}</div>
+            <button class="primary small" onclick="app.shadowCreate('${u.protocol}', '${u.uid}')">Создать</button>
+        `;
+        innerEl.appendChild(el);
+    });
+}
+
+// Export for inline HTML onclick
+window.app = {
+    shadowCreate: async (proto, uid) => {
+        const name = prompt("Имя объекта:", `Unit ${uid}`);
+        if(!name) return;
+        try {
+            await authFetch(`/web/api/shadow/${proto}/${uid}/create`, {
+                method: "POST", body: JSON.stringify({name, node_id:1})
+            });
+            toggleShadowMode(); // Go back to monitor
+        } catch(e) { alert("Ошибка: " + e); }
+    }
+};
+
+function updateShadowBadge(n) {
+    const b = document.getElementById("shadow-badge");
+    if(b) { b.textContent = n; b.classList.toggle("hidden", n===0); }
+}
+
+
+/* ================= HISTORY MODULE (MASTER-DETAIL) ================= */
+
+let histUnitId = null;
+let histDate = new Date();
+let histLayerGroup = null;
+let trackPointsCache = []; // Кэш точек для интерактива
+let trackCursorMarker = null; // Маркер под курсором
+
+function initHistory() {
+  const backBtn = document.getElementById("history-back");
+  if(backBtn) backBtn.addEventListener("click", exitHistoryMode);
+  
+  const dateInput = document.getElementById("hist-date-picker");
+  if(dateInput) {
+      dateInput.valueAsDate = new Date();
+      dateInput.addEventListener("change", (e) => {
+        if(e.target.valueAsDate) {
+            histDate = e.target.valueAsDate;
+            loadHistoryTrips();
+        }
+      });
+  }
+
+  const prevBtn = document.getElementById("hist-prev");
+  if(prevBtn) prevBtn.addEventListener("click", () => shiftDate(-1));
+  const nextBtn = document.getElementById("hist-next");
+  if(nextBtn) nextBtn.addEventListener("click", () => shiftDate(1));
+  const refreshBtn = document.getElementById("history-refresh-btn");
+  if(refreshBtn) refreshBtn.addEventListener("click", loadHistoryTrips);
+  
+  // Интерактив карты (курсор над треком)
+  if(map) {
+      map.on("mousemove", onMapMouseMove);
+  }
+}
+
+function shiftDate(days) {
+    histDate.setDate(histDate.getDate() + days);
+    const picker = document.getElementById("hist-date-picker");
+    if(picker) picker.valueAsDate = histDate;
+    loadHistoryTrips();
+}
+
+// Вход в режим истории (вызывается из карточки)
+function openHistoryModal(unitId) {
+    // 1. Скрываем основной список и карточку
+    const sidebarMain = document.getElementById("sidebar-main");
+    if(sidebarMain) sidebarMain.classList.add("hidden");
+    hideCard(); // Скрываем карточку объекта
+    
+    // 2. Показываем панель истории
+    const sidebarHist = document.getElementById("sidebar-history");
+    if(sidebarHist) sidebarHist.classList.remove("hidden");
+    
+    histUnitId = unitId;
+    const unit = unitsById.get(unitId);
+    const nameEl = document.getElementById("history-unit-name");
+    if(nameEl) nameEl.textContent = unit ? unit.name : `Unit #${unitId}`;
+    
+    // Сбрасываем дату на сегодня при открытии
+    histDate = new Date();
+    const picker = document.getElementById("hist-date-picker");
+    if(picker) picker.valueAsDate = histDate;
+    
+    // Очищаем предыдущий трек
+    clearHistoryMap();
+    trackPointsCache = [];
+    
+    loadHistoryTrips();
+}
+
+function exitHistoryMode() {
+    // Очищаем карту и кэш
+    clearHistoryMap();
+    trackPointsCache = [];
+    
+    // Переключаем панели
+    document.getElementById("sidebar-history")?.classList.add("hidden");
+    document.getElementById("sidebar-main")?.classList.remove("hidden");
+    
+    // Скрываем инфо-плашку
+    document.getElementById("track-cursor-info")?.classList.add("hidden");
+}
+
+async function loadHistoryTrips() {
+    if (!histUnitId) return;
+    
+    const listEl = document.getElementById("history-timeline");
+    if(listEl) listEl.innerHTML = '<div class="muted" style="padding:20px; text-align:center">Загрузка...</div>';
+    const sumEl = document.getElementById("history-summary");
+    if(sumEl) sumEl.innerHTML = '...';
+    
+    clearHistoryMap();
+    trackPointsCache = [];
+
+    // Начало и конец дня
+    const from = new Date(histDate); from.setHours(0,0,0,0);
+    const to = new Date(histDate); to.setHours(23,59,59,999);
+    
+    const fromTs = Math.floor(from.getTime()/1000);
+    const toTs = Math.floor(to.getTime()/1000);
+
+    try {
+        const res = await authFetch(`/web/api/history/trips?unit_id=${histUnitId}&from_ts=${fromTs}&to_ts=${toTs}`);
+        if (!res.ok) throw new Error("HTTP Error");
+        const trips = await res.json();
+        
+        renderTimeline(trips);
+        calculateDailyStats(trips);
+        
+    } catch (e) {
+        console.error(e);
+        if(listEl) listEl.innerHTML = '<div class="muted" style="text-align:center; padding:20px; color:#ef5350">Ошибка загрузки</div>';
+    }
+}
+
+function calculateDailyStats(trips) {
+    let dist = 0;
+    let maxSpd = 0;
+    trips.forEach(t => {
+        if(t.type === 'trip') {
+            dist += (t.distance_m || 0);
+            if(t.max_speed > maxSpd) maxSpd = t.max_speed;
+        }
+    });
+    const distKm = (dist / 1000).toFixed(1);
+    const sumEl = document.getElementById("history-summary");
+    if(sumEl) sumEl.innerHTML = `
+        <span class="sum-item"><span class="sum-val">${distKm}</span> <span class="sum-lbl">Пробег (км)</span></span>
+        <span class="sum-item"><span class="sum-val">${maxSpd}</span> <span class="sum-lbl">Макс (км/ч)</span></span>
+    `;
+}
+
+function renderTimeline(trips) {
+    const listEl = document.getElementById("history-timeline");
+    if(!listEl) return;
+    listEl.innerHTML = "";
+    
+    if (!trips || !trips.length) {
+        listEl.innerHTML = '<div class="muted" style="padding:20px; text-align:center">Нет поездок за этот день</div>';
+        return;
+    }
+
+    trips.forEach(t => {
+        const el = document.createElement("div");
+        const isTrip = t.type === 'trip';
+        el.className = `timeline-item ${isTrip ? 'trip' : (t.type === 'stop' ? 'stop' : 'stay')}`;
+        
+        const start = new Date(t.start_ts * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+        const end = new Date(t.end_ts * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+        
+        let detailHtml = "";
+        let icon = "";
+        
+        if (isTrip) {
+            icon = "🚗";
+            const km = (t.distance_m / 1000).toFixed(1);
+            detailHtml = `${km} км &bull; макс ${t.max_speed} км/ч`;
+        } else {
+            icon = t.type === 'stop' ? "🛑" : "🅿️";
+            detailHtml = t.type === 'stop' ? 'Остановка' : 'Стоянка';
+        }
+        
+        const addr = t.start_address || (isTrip ? "Начало движения" : "Адрес определяется...");
+
+        el.innerHTML = `
+            <div class="t-icon">${icon}</div>
+            <div class="t-row">
+                <span class="t-time">${start} - ${end}</span>
+                <span class="t-dur">${t.duration_str}</span>
+            </div>
+            <div class="t-detail">${detailHtml}</div>
+            <div class="t-addr">${addr}</div>
+        `;
+        
+        el.addEventListener("click", () => {
+            listEl.querySelectorAll(".timeline-item").forEach(x => x.classList.remove("active"));
+            el.classList.add("active");
+            loadTrackOnMap(t);
+        });
+        
+        listEl.appendChild(el);
+    });
+}
+
+async function loadTrackOnMap(trip) {
+    clearHistoryMap();
+    if (!map) return;
+    
+    // Скрываем инфо-плашку пока грузим
+    document.getElementById("track-cursor-info")?.classList.add("hidden");
+
+    try {
+        const res = await authFetch(`/web/api/history/track?unit_id=${trip.unit_id}&from_ts=${trip.start_ts}&to_ts=${trip.end_ts}`);
+        const points = await res.json();
+        
+        if (!points.length) {
+            showToast("Нет точек трека");
+            return;
+        }
+        
+        // Сохраняем для интерактива
+        trackPointsCache = points;
+
+        histLayerGroup = L.layerGroup().addTo(map);
+
+        // 1. Линия трека
+        const latlngs = points.map(p => [p.lat, p.lon]);
+        L.polyline(latlngs, {
+            color: '#3b82f6', 
+            weight: 4, 
+            opacity: 0.8,
+            lineJoin: 'round'
+        }).addTo(histLayerGroup);
+
+        // 2. Маркеры Старт (A) / Финиш (B)
+        const startPt = latlngs[0];
+        const endPt = latlngs[latlngs.length - 1];
+
+        createMarker(startPt, "A", "#4caf50").addTo(histLayerGroup); // Зеленый
+        createMarker(endPt, "B", "#f44336").addTo(histLayerGroup);   // Красный
+
+        // 3. Стрелки (исправленный расчет через проекцию экрана)
+        drawArrows(points, histLayerGroup);
+
+        // Зум к треку
+        map.fitBounds(L.latLngBounds(latlngs), { padding: [50, 50] });
+        
+        showToast("Трек загружен");
+
+    } catch(e) {
+        console.error(e);
+        showToast("Ошибка загрузки трека");
+    }
+}
+
+function createMarker(latlng, label, color) {
+    return L.marker(latlng, {
+        icon: L.divIcon({
+            className: 'map-label-icon',
+            html: `<div style="background:${color}; width:24px; height:24px; border-radius:50%; border:2px solid #fff; color:#fff; font-weight:bold; display:flex; align-items:center; justify-content:center; box-shadow:0 2px 5px rgba(0,0,0,0.5); font-size:12px;">${label}</div>`,
+            iconSize: [24, 24],
+            iconAnchor: [12, 12]
+        })
+    });
+}
+
+function drawArrows(points, layerGroup) {
+    if (points.length < 2) return;
+    
+    // Рисуем стрелку каждые ~20 точек или 500-1000 метров, чтобы не спамить
+    const step = Math.max(10, Math.floor(points.length / 15)); 
+    
+    for (let i = 0; i < points.length - 1; i += step) {
+        const p1 = points[i];
+        const p2 = points[i+1];
+        
+        // Считаем угол через экранные координаты Leaflet для точности отображения
+        const pp1 = map.latLngToLayerPoint([p1.lat, p1.lon]);
+        const pp2 = map.latLngToLayerPoint([p2.lat, p2.lon]);
+        
+        const dx = pp2.x - pp1.x;
+        const dy = pp2.y - pp1.y;
+        
+        // Если точки слишком близко на экране, стрелка будет кривой, пропускаем
+        if (dx*dx + dy*dy < 20) continue; 
+
+        // Угол в градусах (0 = вправо, 90 = вниз)
+        const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+        
+        L.marker([p2.lat, p2.lon], {
+            icon: L.divIcon({
+                className: '',
+                html: `<div class="arrow-icon" style="transform: rotate(${angle}deg);">➤</div>`,
+                iconSize: [20, 20],
+                iconAnchor: [10, 10]
+            }),
+            interactive: false // Чтобы не мешали наведению
+        }).addTo(layerGroup);
+    }
+}
+
+function clearHistoryMap() {
+    if (histLayerGroup) {
+        map.removeLayer(histLayerGroup);
+        histLayerGroup = null;
+    }
+    if (trackCursorMarker) {
+        map.removeLayer(trackCursorMarker);
+        trackCursorMarker = null;
+    }
+    document.getElementById("track-cursor-info")?.classList.add("hidden");
+}
+
+// Обработчик движения мыши по карте для интерактива трека
+function onMapMouseMove(e) {
+    if (!trackPointsCache.length || !histLayerGroup) return;
+    
+    // Ищем ближайшую точку трека к курсору мыши
+    let minDist = Infinity;
+    let closest = null;
+    const mousePoint = map.latLngToLayerPoint(e.latlng);
+    
+    // Оптимизация: бежим не по всем точкам, если их очень много, но 5000 JS переварит
+    for (const pt of trackPointsCache) {
+        const layerPoint = map.latLngToLayerPoint([pt.lat, pt.lon]);
+        const dx = layerPoint.x - mousePoint.x;
+        const dy = layerPoint.y - mousePoint.y;
+        const distSq = dx*dx + dy*dy;
+        
+        if (distSq < minDist) {
+            minDist = distSq;
+            closest = pt;
+        }
+    }
+    
+    // Если курсор ближе 20 пикселей к треку
+    if (closest && minDist < 400) { 
+        showTrackCursor(closest);
+    } else {
+        hideTrackCursor();
+    }
+}
+
+function showTrackCursor(pt) {
+    const infoBox = document.getElementById("track-cursor-info");
+    if (!infoBox) return;
+    
+    // Обновляем текст
+    const timeStr = new Date(pt.ts * 1000).toLocaleTimeString();
+    infoBox.querySelector(".ti-time").textContent = timeStr;
+    infoBox.querySelector(".ti-speed").textContent = Math.round(pt.speed || 0) + " км/ч";
+    
+    infoBox.classList.remove("hidden");
+    
+    // Рисуем/двигаем кружок на карте
+    if (!trackCursorMarker) {
+        trackCursorMarker = L.circleMarker([pt.lat, pt.lon], {
+            radius: 6,
+            color: '#fff',
+            fillColor: '#4caf50',
+            fillOpacity: 1,
+            weight: 2,
+            interactive: false
+        }).addTo(map);
+    } else {
+        trackCursorMarker.setLatLng([pt.lat, pt.lon]);
+        trackCursorMarker.bringToFront();
+    }
+}
+
+function hideTrackCursor() {
+    document.getElementById("track-cursor-info")?.classList.add("hidden");
+    if (trackCursorMarker) {
+        map.removeLayer(trackCursorMarker);
+        trackCursorMarker = null;
+    }
+}
+
+// --- Auth / Login UI ---
+let loginInitDone = false;
+let loginOverlayEl, loginErrorEl, loginLoginInput, loginPasswordInput, loginSubmitBtn;
+
+function initLoginModal() {
+  if (loginInitDone) return;
+  loginInitDone = true;
+  loginOverlayEl = document.getElementById("login-overlay");
+  loginErrorEl = document.getElementById("login-error");
+  loginLoginInput = document.getElementById("login-login");
+  loginPasswordInput = document.getElementById("login-password");
+  loginSubmitBtn = document.getElementById("login-submit");
+  if (!loginOverlayEl) return;
+  
+  loginSubmitBtn.addEventListener("click", doLogin);
+  document.getElementById("login-form").addEventListener("submit", e => {
+      e.preventDefault(); doLogin();
+  });
+}
+
+async function doLogin() {
+    const login = loginLoginInput.value.trim();
+    const password = loginPasswordInput.value;
+    if (!login || !password) { loginErrorEl.textContent = "Введите логин и пароль"; return; }
+    
+    loginErrorEl.textContent = "";
+    loginSubmitBtn.disabled = true;
+    try {
+        const res = await fetch("/web/api/login", {
+            method: "POST", headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({login, password})
+        });
+        if (res.ok) {
+            const data = await res.json();
+            localStorage.setItem(SESSION_KEY, data.session_id);
+            localStorage.setItem(SESSION_INFO_KEY, JSON.stringify(data));
+            loginOverlayEl.classList.add("hidden");
+            applySessionInfo(data);
+        } else {
+            loginErrorEl.textContent = "Ошибка входа";
+        }
+    } catch(e) { loginErrorEl.textContent = "Ошибка сети"; }
+    finally { loginSubmitBtn.disabled = false; }
+}
+
+function showLoginModal() {
+    initLoginModal();
+    loginOverlayEl?.classList.remove("hidden");
+}
+
+async function ensureLoginSession() {
+    return new Promise(resolve => {
+        const sid = localStorage.getItem(SESSION_KEY);
+        if(sid) resolve(sid);
+        else showLoginModal();
+        // Poll for session
+        const i = setInterval(() => {
+            const s = localStorage.getItem(SESSION_KEY);
+            if(s) { clearInterval(i); resolve(s); }
+        }, 500);
+    });
+}
+
+function getWatchIds() {
+    // Return currently visible units + selection
+    // Simplified: return top 100 + selected
+    const ids = [];
+    if(selectedId) ids.push(selectedId);
+    if(current.length) {
+        ids.push(...current.slice(0, 100).map(u=>u.id));
+    }
+    return [...new Set(ids)];
+}
+
+function formatRelativeTime(ts) {
+    if(!ts) return "";
+    const diff = Math.floor(Date.now()/1000 - ts);
+    if(diff < 60) return `${diff} сек назад`;
+    if(diff < 3600) return `${Math.floor(diff/60)} мин назад`;
+    return `${Math.floor(diff/3600)} ч назад`;
+}

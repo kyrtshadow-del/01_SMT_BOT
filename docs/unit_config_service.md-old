@@ -1,0 +1,69 @@
+## UnitConfigService Design
+
+Goal: provide a single entry point to read/write/validate unit configuration snapshots (`UnitConfig`)
+independently of the data acquisition stack. The service lives under `pipeline/config/unit_config_service.py`
+and operates on JSON documents stored next to pipeline data.
+
+### Storage layout
+
+- Base directory: `<PIPELINE_STORAGE_ROOT>/unit_configs`.
+- File naming: `{unit_id}.json`.
+- Metadata file (optional, future): `index.json` for quick lookups; currently file system listing is enough.
+- Each JSON document follows the schema defined in `docs/unit_config_schema.md`.
+
+### Responsibilities
+
+1. **Persistence**
+   - `save(config: UnitConfig)` dumps JSON (sorted keys, UTF-8) and writes atomically via temp file + rename.
+   - `load(unit_id: int)` reads JSON, validates, converts back into `UnitConfig`.
+   - `list_configs()` enumerates available unit IDs + timestamps (mtime).
+2. **Validation**
+   - Service tries to load `jsonschema` library. If available, validates payload against the canonical schema
+     bundled with the repo (Python dict mirror of the doc). If library is missing, service logs a warning and
+     performs a minimal structural check (presence of `unit_id`/`source_kind`).
+   - Extra validators can be injected (callables) for custom logic (e.g. sensor references, tank IDs).
+3. **Serialization helpers**
+   - Static helpers to convert dataclasses <-> plain dict (`UnitConfigService.to_dict`, `.from_dict`).
+   - Preserve `None` values, keep numbers as-is, avoid accidentally dropping `extra/meta`.
+4. **Concurrency / locking**
+   - Use per-file `Lock` objects in memory to avoid concurrent writes from a single process.
+   - Atomic rename guarantees readers either see old or new file.
+5. **Integration points**
+   - Importers (Wialon, future providers) call `save()` after mapping legacy data to `UnitConfig`.
+   - Bot/UI reads from service to render cards or populate editors.
+   - CLI tooling can dump configs via the same API.
+
+### Public API (initial draft)
+
+```python
+service = UnitConfigService(root=Path(...))
+config = service.load(15610)
+service.save(config)
+
+service.list_configs()  # -> [UnitConfigSummary(unit_id=..., path=..., updated_ts=...)]
+
+service.delete(15610)  # optional helper, keeps errors centralized
+```
+
+Where `UnitConfigSummary` is a light dataclass carrying `unit_id`, `path`, `updated_ts`, `source_kind`.
+
+### Future extensions
+
+- Versioned configs (keep history via `<unit_id>/<timestamp>.json`).
+- Schema migrations (store `schema_version` inside payload).
+- Remote sync (publish diffs to object storage).
+- Validation CLI (`python -m pipeline.cli.validate_unit_config path/to/file.json`).
+
+This design unblocks Step 2 of the roadmap: we can now implement the service and basic tests while keeping
+the rest of the pipeline decoupled from the raw `.wlp` exports.
+
+### Snapshot automation
+
+- `unit_snapshot.json.gz` now mirrors the current UnitConfig/units cache automatically. Every time the
+  background unit-file updater rebuilds `data/units.v1.json.gz`, the bot runs
+  `pipeline/services/unit_snapshot_sync.py` to refresh `UnitSnapshotService`. Startup also bootstraps from the
+  latest cache, so no manual “Загрузить объекты в кэш” action is required.
+- Tooling (`pipeline/cli/run_stream.py`) reads unit IDs from `unit_snapshot.json.gz` first, falling back to
+  the legacy cache only if the new file is missing. Manual imports are still available through
+  `python -m pipeline.cli.import_unit_config --wlp <file> --unit-id <id>`, which stores configs in
+  `<PIPELINE_STORAGE_ROOT>/unit_configs` and keeps the snapshot in sync.

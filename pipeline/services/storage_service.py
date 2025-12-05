@@ -190,6 +190,9 @@ class PipelineStorageService:
 
         if not events:
             return 0
+        # Optional: also write to Postgres (for trips/history) if DSN provided
+        db_dsn = os.getenv("DEVICE_REGISTRY_DSN") or os.getenv("DATABASE_URL")
+
         grouped = defaultdict(list)
         for event in events:
             day_key = datetime.fromtimestamp(event.device_ts, tz=timezone.utc).date().isoformat()
@@ -197,6 +200,40 @@ class PipelineStorageService:
         total = 0
         for day_key, chunk in grouped.items():
             total += self.raw_storage.append(day_key, chunk)
+
+        if db_dsn:
+            try:
+                import psycopg
+
+                rows = []
+                for ev in events:
+                    rows.append(
+                        (
+                            ev.unit_id,
+                            ev.device_ts,
+                            ev.received_ts or ev.device_ts,
+                            ev.latitude,
+                            ev.longitude,
+                            ev.speed,
+                            ev.course,
+                            ev.params or {},
+                            ev.raw_payload or {},
+                        )
+                    )
+                if rows:
+                    with psycopg.connect(db_dsn, autocommit=True) as conn:
+                        cur = conn.cursor()
+                        cur.executemany(
+                            """
+                            INSERT INTO events (unit_id, device_ts, received_ts, lat, lon, speed, course, params, raw)
+                            VALUES (%s, to_timestamp(%s), to_timestamp(%s), %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT DO NOTHING
+                            """,
+                            rows,
+                        )
+            except Exception as exc:  # pragma: no cover
+                _log.warning("raw_storage: failed to insert events into DB: %s", exc)
+
         self.latest_store.update_from_events(events)
         return total
 

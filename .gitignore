@@ -9,6 +9,8 @@ __pycache__/
 .coverage
 .env
 .venv/
+.idea/
+.vscode/
 
 # Editors / OS
 .DS_Store
@@ -19,26 +21,39 @@ __pycache__/
 # Project artifacts
 data/
 logs/
+scratch/
+node_modules/
+backups/
+backup_mybot_/
+history_ui_snapshot/
+shadow_track_bundle/
+snapshot_review/
+support_question/
+share_for_review/
+OLD VERSION/
+WIalon_Massage/
+stream/
+__pycache__/
 *.log
 *.gz
 *.zip
 *.tar
 *.tgz
+*.jsonl
+*.sqlite3
+*.db
 tmp_*.txt
 *.tmp
 *.bak
-
+*.Zone.Identifier
+*.Zone.Identifier:Zone.Identifier
+tmp_*/
+*.iml
+*.code-workspace
 # Local exports / dumps
 Wialon Message/
 Карточка объекта/
-OLD VERSION/
 account_data.json
 account_get_account_data.html
 core_get_account_data.html
 tmp_wialon*.*
-
-# Misc scratch / generated files
-scratch/
-tmp_*/
-*.iml
-*.code-workspace

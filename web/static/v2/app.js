@@ -1,4 +1,11 @@
 const MAP_KEY = "smt_map_state_v2";
+const TILE_URL_DEFAULT = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png";
+const TILE_OPTS_DEFAULT = {
+  attribution:
+    '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+  subdomains: "abcd",
+  maxZoom: 20,
+};
 const SESSION_KEY = "smt_session_v2";
 const SESSION_INFO_KEY = "smt_session_info_v1";
 const ROW_H = 60;
@@ -113,6 +120,19 @@ const CARD_ANCHOR_OFFSET = 8;
 const DETAIL_CACHE_LIMIT = 300;
 let nearbyCardState = { unitId: null, visible: false, list: [] };
 const detailCache = new Map(); // unitId -> { ts, data }
+let historyChart = null; // Chart.js instance for history graph
+let calendarInstance = null;
+let calendarCache = {}; // month => {YYYY-MM-DD: dist_m}
+let eventMarkersLayer = null;
+// Player state
+let playerState = {
+  animFrame: null,
+  idx: 0,
+  isPlaying: false,
+  marker: null,
+  speedMultiplier: 5,
+  lastTick: 0,
+};
 let loginOverlayEl = null;
 let loginErrorEl = null;
 let loginLoginInput = null;
@@ -1836,10 +1856,24 @@ function initMap() {
   // Достаточно указать путь к каталогу с иконками; сами имена Leaflet подставит
   L.Icon.Default.imagePath = "/static/vendor/leaflet/images/";
   map = L.map("map", { zoomControl: true }).setView(center, zoom);
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    maxZoom: 19,
-    attribution: "&copy; OpenStreetMap",
-  }).addTo(map);
+
+  // Тёмная тема по умолчанию; при сбое откатываемся на стандартный OSM
+  const tileUrl = window.OFFLINE_TILE_URL || window.MAP_TILE_URL || TILE_URL_DEFAULT;
+  const tileOpts = window.OFFLINE_TILE_URL
+    ? { maxZoom: 19, attribution: "" }
+    : { ...TILE_OPTS_DEFAULT };
+
+  const baseLayer = L.tileLayer(tileUrl, tileOpts).addTo(map);
+  baseLayer.on("tileerror", () => {
+    if (baseLayer._fallbackApplied) return;
+    baseLayer._fallbackApplied = true;
+    map.removeLayer(baseLayer);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap",
+    }).addTo(map);
+  });
+
   map.on("moveend", () => {
     const c = map.getCenter();
     localStorage.setItem(MAP_KEY, JSON.stringify({ center: [c.lat, c.lng], zoom: map.getZoom() }));
@@ -3514,26 +3548,19 @@ function initHistory() {
   document.getElementById("hist-prev")?.addEventListener("click", () => shiftHistoryDate(-1));
   document.getElementById("hist-next")?.addEventListener("click", () => shiftHistoryDate(1));
   document.getElementById("history-refresh-btn")?.addEventListener("click", loadHistoryTrips);
-  const dateInput = document.getElementById("hist-date-picker");
-  if (dateInput) {
-    dateInput.valueAsDate = histDate;
-    dateInput.addEventListener("change", (e) => {
-      if (e.target.valueAsDate) {
-        histDate = e.target.valueAsDate;
-        loadHistoryTrips();
-      }
-    });
-  }
+  initHistoryCalendar();
   // курсор по треку
   if (map) {
     map.on("mousemove", onMapMouseMove);
   }
+
+  initHistoryChart();
+  initTrackPlayer();
 }
 
 function shiftHistoryDate(deltaDays) {
   histDate.setDate(histDate.getDate() + deltaDays);
-  const picker = document.getElementById("hist-date-picker");
-  if (picker) picker.valueAsDate = histDate;
+  syncHistoryDateInputs(false);
   loadHistoryTrips();
 }
 
@@ -3548,8 +3575,9 @@ function openHistoryModal(unitId) {
   const nameEl = document.getElementById("history-unit-name");
   if (nameEl) nameEl.textContent = u ? u.name : `Unit #${unitId}`;
   histDate = new Date();
-  const picker = document.getElementById("hist-date-picker");
-  if (picker) picker.valueAsDate = histDate;
+  syncHistoryDateInputs(true);
+  calendarCache = {};
+  refreshCalendarMonth();
   clearHistoryMap();
   trackPointsCache = [];
   loadHistoryTrips();
@@ -3565,12 +3593,94 @@ function exitHistoryMode() {
   hideTrackCursor();
 }
 
+function syncHistoryDateInputs(setInputValue) {
+  const picker = document.getElementById("hist-date-picker");
+  if (picker && setInputValue) {
+    picker.value = histDate.toISOString().slice(0, 10);
+  }
+  if (calendarInstance) {
+    calendarInstance.setDate(histDate, false);
+  }
+}
+
+function refreshCalendarMonth() {
+  if (!calendarInstance) return;
+  updateCalendarActivity(calendarInstance.currentYear, calendarInstance.currentMonth, calendarInstance);
+}
+
+function initHistoryCalendar() {
+  const input = document.getElementById("hist-date-picker");
+  if (!input || !window.flatpickr) {
+    // fallback: keep native date input behavior
+    input && (input.valueAsDate = histDate);
+    input?.addEventListener("change", (e) => {
+      if (e.target.valueAsDate) {
+        histDate = e.target.valueAsDate;
+        loadHistoryTrips();
+      }
+    });
+    return;
+  }
+
+  calendarInstance = flatpickr(input, {
+    locale: "ru",
+    dateFormat: "d.m.Y",
+    disableMobile: true,
+    defaultDate: histDate,
+    onChange: (selectedDates) => {
+      if (selectedDates[0]) {
+        histDate = selectedDates[0];
+        loadHistoryTrips();
+      }
+    },
+    onMonthChange: (_sel, _str, inst) => {
+      updateCalendarActivity(inst.currentYear, inst.currentMonth, inst);
+    },
+    onOpen: (_sel, _str, inst) => {
+      updateCalendarActivity(inst.currentYear, inst.currentMonth, inst);
+    },
+    onDayCreate: (_dObj, _dStr, fp, dayElem) => decorateCalendarDay(dayElem),
+  });
+}
+
+async function updateCalendarActivity(year, monthIndex, instance) {
+  if (!histUnitId) return;
+  const monthStr = `${year}-${String(monthIndex + 1).padStart(2, "0")}`;
+  if (!calendarCache[monthStr]) {
+    try {
+      const res = await authFetch(`/web/api/history/calendar?unit_id=${histUnitId}&month=${monthStr}`);
+      if (res.ok) {
+        calendarCache[monthStr] = await res.json();
+      }
+    } catch (e) {
+      console.error("calendar fetch error", e);
+    }
+  }
+  if (instance) instance.redraw();
+}
+
+function decorateCalendarDay(dayElem) {
+  if (!dayElem?.dateObj) return;
+  const y = dayElem.dateObj.getFullYear();
+  const m = String(dayElem.dateObj.getMonth() + 1).padStart(2, "0");
+  const d = String(dayElem.dateObj.getDate()).padStart(2, "0");
+  const monthKey = `${y}-${m}`;
+  const key = `${y}-${m}-${d}`;
+  const monthData = calendarCache[monthKey];
+  if (!monthData || !monthData[key]) return;
+  const dist = monthData[key];
+  const dot = document.createElement("span");
+  dot.className = "event-dot";
+  if (dist > 300_000) dot.style.background = "#4caf50"; // >300 км
+  else if (dist > 50_000) dot.style.background = "#ff9800"; // >50 км
+  else dot.style.background = "#9e9e9e";
+  dayElem.appendChild(dot);
+}
+
 async function loadHistoryTrips() {
   if (!histUnitId) return;
   const listEl = document.getElementById("history-timeline");
-  const sumEl = document.getElementById("history-summary");
   if (listEl) listEl.innerHTML = '<div class="muted" style="padding:20px; text-align:center">Загрузка...</div>';
-  if (sumEl) sumEl.innerHTML = '<span class="sum-item"><span class="sum-val">—</span><span class="sum-lbl">Пробег</span></span><span class="sum-item"><span class="sum-val">—</span><span class="sum-lbl">Макс</span></span>';
 
   const from = new Date(histDate);
   from.setHours(0, 0, 0, 0);
@@ -3585,6 +3695,7 @@ async function loadHistoryTrips() {
     const trips = await res.json();
     renderTimeline(trips);
     calculateDailyStats(trips);
+    drawTripMarkers(trips);
   } catch (e) {
     console.error("history trips error", e);
     if (listEl) listEl.innerHTML = '<div class="muted" style="padding:20px; text-align:center;color:#ef5350">Ошибка загрузки</div>';
@@ -3593,22 +3704,31 @@ async function loadHistoryTrips() {
 }
 
 function calculateDailyStats(trips) {
-  let dist = 0;
+  let totalDist = 0;
   let maxSpd = 0;
-  trips.forEach((t) => {
+  let moveSec = 0;
+  trips?.forEach((t) => {
     if (t.type === "trip") {
-      dist += t.distance_m || 0;
+      totalDist += t.distance_m || 0;
       if (t.max_speed > maxSpd) maxSpd = t.max_speed;
+      moveSec += Math.max(0, (t.end_ts || 0) - (t.start_ts || 0));
     }
   });
-  const distKm = (dist / 1000).toFixed(1);
-  const sumEl = document.getElementById("history-summary");
-  if (sumEl) {
-    sumEl.innerHTML = `
-      <span class="sum-item"><span class="sum-val">${distKm}</span> <span class="sum-lbl">Пробег (км)</span></span>
-      <span class="sum-item"><span class="sum-val">${maxSpd}</span> <span class="sum-lbl">Макс (км/ч)</span></span>
-    `;
-  }
+
+  const distKm = (totalDist / 1000).toFixed(1);
+  const h = Math.floor(moveSec / 3600);
+  const m = Math.floor((moveSec % 3600) / 60);
+  const timeStr = h ? `${h}ч ${m}м` : `${m} мин`;
+  const avgSpeed = moveSec > 0 ? Math.round((totalDist / moveSec) * 3.6) : 0;
+
+  const distEl = document.getElementById("hs-dist");
+  const timeEl = document.getElementById("hs-time");
+  const maxEl = document.getElementById("hs-max");
+  const avgEl = document.getElementById("hs-avg");
+  if (distEl) distEl.textContent = distKm;
+  if (timeEl) timeEl.textContent = timeStr;
+  if (maxEl) maxEl.textContent = maxSpd;
+  if (avgEl) avgEl.textContent = avgSpeed;
 }
 
 function renderTimeline(trips) {
@@ -3622,25 +3742,46 @@ function renderTimeline(trips) {
   trips.forEach((t) => {
     const el = document.createElement("div");
     const isTrip = t.type === "trip";
-    el.className = `timeline-item ${isTrip ? "trip" : t.type === "stop" ? "stop" : "stay"}`;
+    const isStop = t.type === "stop";
+    const typeClass = isTrip ? "trip" : isStop ? "stop" : "stay";
+    el.className = `timeline-item ${typeClass}`;
+    el.dataset.id = t.id;
     const start = new Date(t.start_ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     const end = new Date(t.end_ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    let detailHtml = "";
-    let icon = "";
+
+    let iconContent = "";
+    let title = "";
+    let meta = "";
+
     if (isTrip) {
-      icon = "🚗";
+      iconContent = "🚗";
       const km = (t.distance_m / 1000).toFixed(1);
-      detailHtml = `${km} км • макс ${t.max_speed} км/ч`;
+      title = `Поездка ${km} км`;
+      meta = `макс ${t.max_speed} км/ч`;
+    } else if (isStop) {
+      iconContent = "🛑";
+      title = "Остановка";
+      meta = "двигатель работал";
     } else {
-      icon = t.type === "stop" ? "🛑" : "🅿️";
-      detailHtml = t.type === "stop" ? "Остановка" : "Стоянка";
+      iconContent = "🅿️";
+      title = "Стоянка";
+      meta = "двигатель выкл";
     }
-    const addr = t.start_address || (isTrip ? "Начало движения" : "Адрес определяется…");
+
+    const addr = t.start_address || "Адрес определяется...";
     el.innerHTML = `
-      <div class="t-icon">${icon}</div>
-      <div class="t-row"><span class="t-time">${start} – ${end}</span><span class="t-dur">${t.duration_str}</span></div>
-      <div class="t-detail">${detailHtml}</div>
-      <div class="t-addr">${addr}</div>
+      <div class="t-icon-box">${iconContent}</div>
+      <div class="t-body">
+        <div class="t-header">
+          <span>${title}</span>
+          <span class="t-time-range">${start} — ${end}</span>
+        </div>
+        <div class="t-meta">
+          <span>${t.duration_str}</span>
+          ${meta ? `<span>• ${meta}</span>` : ""}
+        </div>
+        <div class="t-addr" title="${addr}">${addr}</div>
+      </div>
     `;
     el.addEventListener("click", () => {
       listEl.querySelectorAll(".timeline-item").forEach((x) => x.classList.remove("active"));
@@ -3665,19 +3806,394 @@ async function loadTrackOnMap(trip) {
     }
     trackPointsCache = points;
     histLayerGroup = L.layerGroup().addTo(map);
-    const latlngs = points.map((p) => [p.lat, p.lon]);
-    L.polyline(latlngs, { color: "#3b82f6", weight: 4, opacity: 0.8, lineJoin: "round" }).addTo(histLayerGroup);
-    const startPt = latlngs[0];
-    const endPt = latlngs[latlngs.length - 1];
+    drawColoredTrack(points, histLayerGroup);
+    const startPt = [points[0].lat, points[0].lon];
+    const endPt = [points[points.length - 1].lat, points[points.length - 1].lon];
     createMarker(startPt, "A", "#4caf50").addTo(histLayerGroup);
     createMarker(endPt, "B", "#f44336").addTo(histLayerGroup);
     drawArrows(points, histLayerGroup);
+    const latlngs = points.map((p) => [p.lat, p.lon]);
     map.fitBounds(L.latLngBounds(latlngs), { padding: [50, 50] });
+
+    attachTrackClickLayer(latlngs);
+    initPlayerSlider(points);
+    renderHistoryChart(points);
     showToast("Трек загружен");
   } catch (e) {
     console.error("history track error", e);
     showToast("Ошибка загрузки трека");
   }
+}
+
+function getSpeedColor(speed) {
+  if (speed < 5) return "#3b82f6"; // стоянка/медленно
+  if (speed < 60) return "#4caf50"; // город
+  if (speed < 90) return "#ff9800"; // трасса
+  return "#f44336"; // быстро
+}
+
+// Bearing between two lat/lon points (deg, 0..360)
+function getBearing(lat1, lon1, lat2, lon2) {
+  const toRad = (d) => (d * Math.PI) / 180;
+  const toDeg = (r) => (r * 180) / Math.PI;
+  const y = Math.sin(toRad(lon2 - lon1)) * Math.cos(toRad(lat2));
+  const x =
+    Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
+    Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(toRad(lon2 - lon1));
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+
+function initHistoryChart() {
+  const ctx = document.getElementById("history-chart");
+  const wrapper = document.getElementById("history-chart-wrapper");
+  if (!ctx || historyChart) return;
+
+  const verticalLinePlugin = {
+    id: "historyVerticalLine",
+    afterDraw: (chart) => {
+      const active = chart.tooltip?._active;
+      if (active && active.length) {
+        const x = active[0].element.x;
+        const { top, bottom } = chart.scales.y;
+        const c = chart.ctx;
+        c.save();
+        c.beginPath();
+        c.moveTo(x, top);
+        c.lineTo(x, bottom);
+        c.lineWidth = 1;
+        c.setLineDash([5, 5]);
+        c.strokeStyle = "rgba(255,255,255,0.5)";
+        c.stroke();
+        c.restore();
+      }
+    },
+  };
+
+  historyChart = new Chart(ctx, {
+    type: "line",
+    data: { labels: [], datasets: [] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: "rgba(17,24,39,0.9)",
+          borderColor: "#4caf50",
+          borderWidth: 1,
+          titleColor: "#fff",
+          bodyColor: "#cbd5e1",
+        },
+      },
+      scales: {
+        x: { display: false },
+        y: {
+          beginAtZero: true,
+          grid: { color: "rgba(255,255,255,0.08)" },
+          ticks: { color: "#9ca3af", font: { size: 10 } },
+        },
+      },
+      onHover: (evt, elements) => {
+        if (elements && elements.length > 0) {
+          const idx = elements[0].index;
+          if (trackPointsCache && trackPointsCache[idx]) {
+            showTrackCursor(trackPointsCache[idx]);
+          }
+        }
+      },
+    },
+    plugins: [verticalLinePlugin],
+  });
+
+  if (wrapper) wrapper.classList.add("hidden");
+}
+
+function renderHistoryChart(points) {
+  const wrapper = document.getElementById("history-chart-wrapper");
+  if (!wrapper) return;
+  if (!points || points.length < 2) {
+    wrapper.classList.add("hidden");
+    return;
+  }
+
+  if (!historyChart) initHistoryChart();
+  if (!historyChart) return;
+
+  wrapper.classList.remove("hidden");
+
+  const labels = points.map((p) => new Date(p.ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+  const speeds = points.map((p) => Math.round(p.speed || 0));
+
+  historyChart.data.labels = labels;
+  historyChart.data.datasets = [
+    {
+      label: "Скорость (км/ч)",
+      data: speeds,
+      borderColor: "#4caf50",
+      borderWidth: 2,
+      fill: true,
+      backgroundColor: (ctx) => {
+        const g = ctx.chart.ctx.createLinearGradient(0, 0, 0, 200);
+        g.addColorStop(0, "rgba(76,175,80,0.35)");
+        g.addColorStop(1, "rgba(76,175,80,0)");
+        return g;
+      },
+      pointRadius: 0,
+      pointHoverRadius: 4,
+      tension: 0.2,
+    },
+  ];
+
+  historyChart.update();
+}
+
+// -------------------- Плеер трека --------------------
+
+function initTrackPlayer() {
+  const btn = document.getElementById("track-play-btn");
+  const slider = document.getElementById("track-slider");
+  const speedSel = document.getElementById("player-speed");
+
+  if (btn) btn.onclick = togglePlay;
+
+  if (slider) {
+    slider.oninput = (e) => {
+      stopPlayer();
+      const btnPlay = document.getElementById("track-play-btn");
+      if (btnPlay) {
+        btnPlay.textContent = "▶";
+        btnPlay.classList.remove("playing");
+      }
+      playerState.idx = Number(e.target.value);
+      updatePlayerVisuals(false);
+    };
+  }
+
+  if (speedSel) {
+    speedSel.onchange = (e) => {
+      playerState.speedMultiplier = Number(e.target.value) / 10;
+    };
+  }
+}
+
+function initPlayerSlider(points) {
+  const slider = document.getElementById("track-slider");
+  if (slider) {
+    slider.max = points.length - 1;
+    slider.value = 0;
+    slider.disabled = false;
+  }
+  const speedSel = document.getElementById("player-speed");
+  playerState.idx = 0;
+  playerState.speedMultiplier = (speedSel ? Number(speedSel.value) : 100) / 10;
+}
+
+function togglePlay() {
+  const btn = document.getElementById("track-play-btn");
+  if (!btn) return;
+
+  if (playerState.isPlaying) {
+    stopPlayer();
+    btn.textContent = "▶";
+    btn.classList.remove("playing");
+    return;
+  }
+
+  if (!trackPointsCache || trackPointsCache.length < 2) {
+    showToast("Нет трека для воспроизведения");
+    return;
+  }
+
+  if (playerState.idx >= trackPointsCache.length - 1) playerState.idx = 0;
+  playerState.isPlaying = true;
+  btn.textContent = "⏸";
+  btn.classList.add("playing");
+
+  playerLoop();
+}
+
+function stopPlayer() {
+  playerState.isPlaying = false;
+  if (playerState.animFrame) cancelAnimationFrame(playerState.animFrame);
+}
+
+function playerLoop() {
+  if (!playerState.isPlaying) return;
+  playerState.idx += playerState.speedMultiplier * 0.2;
+
+  if (playerState.idx >= trackPointsCache.length - 1) {
+    playerState.idx = trackPointsCache.length - 1;
+    updatePlayerVisuals(true);
+    stopPlayer();
+    const btn = document.getElementById("track-play-btn");
+    if (btn) {
+      btn.textContent = "▶";
+      btn.classList.remove("playing");
+    }
+    return;
+  }
+
+  updatePlayerVisuals(true);
+  playerState.animFrame = requestAnimationFrame(playerLoop);
+}
+
+function updatePlayerVisuals(shouldPan = false) {
+  if (!trackPointsCache.length) return;
+  const i = Math.floor(playerState.idx);
+  const pt = trackPointsCache[i];
+  if (!pt) return;
+
+  if (!playerState.marker) {
+    playerState.marker = L.marker([pt.lat, pt.lon], {
+      icon: L.divIcon({
+        className: "player-marker-icon",
+        html: '<div class="nav-arrow"></div>',
+        iconSize: [30, 30],
+        iconAnchor: [15, 15],
+      }),
+      zIndexOffset: 1000,
+    }).addTo(map);
+  }
+
+  playerState.marker.setLatLng([pt.lat, pt.lon]);
+
+  let nextPt = trackPointsCache[i + 5] || trackPointsCache[trackPointsCache.length - 1];
+  if (nextPt && nextPt !== pt) {
+    const angle = getBearing(pt.lat, pt.lon, nextPt.lat, nextPt.lon);
+    const iconEl = playerState.marker.getElement();
+    if (iconEl) {
+      const inner = iconEl.querySelector(".nav-arrow");
+      if (inner) inner.style.transform = `rotate(${angle}deg)`;
+    }
+  }
+
+  if (shouldPan && map && !map.getBounds().pad(-0.1).contains([pt.lat, pt.lon])) {
+    map.panTo([pt.lat, pt.lon], { animate: true, duration: 0.5 });
+  }
+
+  const slider = document.getElementById("track-slider");
+  const timeLbl = document.getElementById("player-time-lbl");
+  if (slider) slider.value = i;
+  if (timeLbl) timeLbl.textContent = new Date(pt.ts * 1000).toLocaleTimeString();
+
+  showTrackCursor(pt);
+
+  if (historyChart) {
+    const meta = historyChart.getDatasetMeta(0);
+    if (meta?.data?.[i]) {
+      const el = meta.data[i];
+      historyChart.tooltip.setActiveElements(
+        [{ datasetIndex: 0, index: i }],
+        { x: el.x, y: el.y }
+      );
+      historyChart.update();
+    }
+  }
+}
+
+function drawColoredTrack(points, layerGroup) {
+  if (points.length < 2) return;
+  let segment = [];
+  let currentColor = getSpeedColor(points[0].speed || 0);
+
+  for (let i = 0; i < points.length - 1; i++) {
+    const p = points[i];
+    const color = getSpeedColor(p.speed || 0);
+    segment.push([p.lat, p.lon]);
+    const colorChanged = color !== currentColor;
+    if (colorChanged) {
+      L.polyline(segment, {
+        color: currentColor,
+        weight: 5,
+        opacity: 0.9,
+        lineJoin: "round",
+        lineCap: "round",
+      }).addTo(layerGroup);
+      segment = [[p.lat, p.lon]];
+      currentColor = color;
+    }
+  }
+
+  // хвост + последняя точка
+  const last = points[points.length - 1];
+  segment.push([last.lat, last.lon]);
+  L.polyline(segment, {
+    color: currentColor,
+    weight: 5,
+    opacity: 0.9,
+    lineJoin: "round",
+    lineCap: "round",
+  }).addTo(layerGroup);
+}
+
+// Клик по линии трека для телепорта плеера
+function attachTrackClickLayer(latlngs) {
+  const clickLine = L.polyline(latlngs, {
+    color: "transparent",
+    weight: 20,
+    opacity: 0,
+  }).addTo(histLayerGroup);
+
+  clickLine.on("click", (e) => {
+    if (!trackPointsCache?.length) return;
+    const clat = e.latlng.lat;
+    const clon = e.latlng.lng;
+    let minDist = Infinity;
+    let closest = 0;
+    for (let i = 0; i < trackPointsCache.length; i += 5) {
+      const p = trackPointsCache[i];
+      const d = Math.abs(p.lat - clat) + Math.abs(p.lon - clon);
+      if (d < minDist) {
+        minDist = d;
+        closest = i;
+      }
+    }
+    playerState.idx = closest;
+    stopPlayer();
+    updatePlayerVisuals(false);
+  });
+}
+
+// Маркеры остановок/стоянок
+function drawTripMarkers(trips) {
+  if (!map) return;
+  if (!eventMarkersLayer) {
+    eventMarkersLayer = L.layerGroup().addTo(map);
+  } else {
+    eventMarkersLayer.clearLayers();
+  }
+
+  trips.forEach((t) => {
+    if (t.type !== "stop" && t.type !== "stay") return;
+    const lat = t.start_lat || t.lat || t.start_latitude;
+    const lon = t.start_lon || t.lon || t.start_longitude;
+    if (!lat || !lon) return;
+    const isStay = t.type === "stay";
+    const label = isStay ? "P" : "S";
+    const color = isStay ? "#3b82f6" : "#ef5350";
+    const icon = L.divIcon({
+      className: "map-stop-icon",
+      html: `<div style="width:100%;height:100%;border-radius:50%;background:${color};display:flex;align-items:center;justify-content:center;">${label}</div>`,
+      iconSize: [20, 20],
+      iconAnchor: [10, 10],
+    });
+    const marker = L.marker([lat, lon], { icon }).bindTooltip(
+      `${isStay ? "Стоянка" : "Остановка"} (${t.duration_str || ""})`,
+      { offset: [0, -10], direction: "top" }
+    );
+    marker.on("click", () => scrollToTimelineItem(t.id));
+    marker.addTo(eventMarkersLayer);
+  });
+}
+
+function scrollToTimelineItem(id) {
+  const el = document.querySelector(`.timeline-item[data-id='${id}']`);
+  if (!el) return;
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  el.classList.add("highlight-flash");
+  setTimeout(() => el.classList.remove("highlight-flash"), 1000);
 }
 
 function createMarker(latlng, label, color) {
@@ -3724,6 +4240,41 @@ function clearHistoryMap() {
     map.removeLayer(trackCursorMarker);
     trackCursorMarker = null;
   }
+  stopPlayer();
+  playerState.idx = 0;
+  playerState.isPlaying = false;
+  if (eventMarkersLayer) eventMarkersLayer.clearLayers();
+  if (playerState.marker) {
+    map.removeLayer(playerState.marker);
+    playerState.marker = null;
+  }
+
+  const btn = document.getElementById("track-play-btn");
+  if (btn) {
+    btn.textContent = "▶";
+    btn.classList.remove("playing");
+  }
+
+  const slider = document.getElementById("track-slider");
+  const timeLbl = document.getElementById("player-time-lbl");
+  if (slider) {
+    slider.value = 0;
+    slider.disabled = true;
+  }
+  if (timeLbl) timeLbl.textContent = "--:--";
+
+  if (historyChart) {
+    historyChart.destroy();
+    historyChart = null;
+  }
+  const wrapper = document.getElementById("history-chart-wrapper");
+  if (wrapper) wrapper.classList.add("hidden");
+
+  document.getElementById("hs-dist")?.replaceChildren(document.createTextNode("—"));
+  document.getElementById("hs-time")?.replaceChildren(document.createTextNode("—"));
+  document.getElementById("hs-max")?.replaceChildren(document.createTextNode("—"));
+  document.getElementById("hs-avg")?.replaceChildren(document.createTextNode("—"));
+
   document.getElementById("track-cursor-info")?.classList.add("hidden");
 }
 

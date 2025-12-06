@@ -8,6 +8,9 @@
   <!-- Leaflet (локальные копии, чтобы работало офлайн) -->
   <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css" />
   <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.markercluster.css" />
+  <!-- Flatpickr (календарь) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/themes/dark.css" />
   <link rel="stylesheet" href="/static/v2/app.css?v={{ static_version }}" />
 </head>
 <body>
@@ -88,16 +91,37 @@
             <div id="history-unit-name" class="h-name">Unit</div>
             <div class="h-dates">
               <button class="date-nav" id="hist-prev">◀</button>
-              <input type="date" id="hist-date-picker">
+              <input type="text" id="hist-date-picker" class="flatpickr-input" placeholder="Выбрать дату">
               <button class="date-nav" id="hist-next">▶</button>
             </div>
           </div>
           <button id="history-refresh-btn" class="ghost icon" title="Обновить">⟳</button>
         </div>
 
-        <div class="history-summary" id="history-summary">
-          <span class="sum-item"><span class="sum-val">—</span> <span class="sum-lbl">Пробег</span></span>
-          <span class="sum-item"><span class="sum-val">—</span> <span class="sum-lbl">Макс</span></span>
+        <div class="history-controls-row">
+          <div id="history-stats-grid" class="h-stats-grid">
+            <div class="hs-cell"><span class="hs-val" id="hs-dist">—</span><span class="hs-lbl">Пробег</span></div>
+            <div class="hs-cell"><span class="hs-val" id="hs-time">—</span><span class="hs-lbl">В движении</span></div>
+            <div class="hs-cell"><span class="hs-val" id="hs-max">—</span><span class="hs-lbl">Макс км/ч</span></div>
+            <div class="hs-cell"><span class="hs-val" id="hs-avg">—</span><span class="hs-lbl">Ср. скор.</span></div>
+          </div>
+        </div>
+
+        <div class="player-controls">
+          <button id="track-play-btn" class="play-btn small" title="Проиграть">▶</button>
+          <div class="slider-container">
+            <input type="range" id="track-slider" min="0" max="100" value="0" step="1" disabled>
+            <div class="player-time" id="player-time-lbl">--:--</div>
+          </div>
+          <select id="player-speed" class="speed-select" title="Скорость">
+            <option value="10">1x</option>
+            <option value="50">5x</option>
+            <option value="100" selected>10x</option>
+          </select>
+        </div>
+
+        <div id="history-chart-wrapper" class="chart-wrapper hidden">
+          <canvas id="history-chart"></canvas>
         </div>
 
         <div id="history-timeline" class="history-timeline">
@@ -296,6 +320,9 @@
 
   <script src="/static/vendor/leaflet/leaflet.js"></script>
   <script src="/static/vendor/leaflet/leaflet.markercluster.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/ru.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script type="module" src="/static/v2/app.js?v={{ static_version }}"></script>
 </body>
 </html>

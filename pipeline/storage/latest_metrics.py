@@ -8,13 +8,6 @@ from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Tuple, Dict, Any
 
 from pipeline.events import Event
-from pipeline.services.unit_snapshot_service import (
-    get_unit_snapshot_service,
-    UnitSnapshotRecord,
-    UnitDeviceMeta,
-)
-
-
 class LatestTelemetryStore:
     """Tracks the latest telemetry payload for each unit."""
 
@@ -75,8 +68,6 @@ class LatestTelemetryStore:
         events = list(events)
         if not events:
             return
-        # Bootstrap snapshot for new units before saving metrics
-        self._bootstrap_units(events)
         with self._lock:
             data = self._load()
             updated = False
@@ -120,20 +111,6 @@ class LatestTelemetryStore:
             if updated:
                 self._save()
                 self._prune_expired()
-
-    def _bootstrap_units(self, events: Iterable[Event]) -> None:
-        """Ensure each unit from events exists in unit_snapshot immediately."""
-        svc = get_unit_snapshot_service()
-        created = 0
-        for ev in events:
-            if svc.has_unit(ev.unit_id):
-                continue
-            record = _build_snapshot_from_event(ev)
-            svc.upsert_unit(record)
-            created += 1
-        if created:
-            # no extra logging here; snapshot service can log if needed
-            pass
 
     def get_latest(self, unit_id: int) -> Mapping[str, object] | None:
         with self._lock:

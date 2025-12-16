@@ -54,23 +54,31 @@ class DeviceRegistry:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT d.protocol, d.uid, l.priority, l.device_id, l.unit_id,
-                       u.sensors_config, d.hardware, d.firmware
+                SELECT d.protocol,
+                       d.uid,
+                       l.priority,
+                       l.device_id,
+                       l.unit_id,
+                       uc.config,
+                       d.hardware,
+                       d.firmware
                   FROM unit_device_links l
-                  JOIN devices d ON d.id = l.device_id
-                  JOIN units u   ON u.id = l.unit_id
-                 WHERE l.valid_to IS NULL
+                  JOIN devices d       ON d.id = l.device_id
+                  JOIN units   u       ON u.id = l.unit_id
+             LEFT JOIN unit_configs uc ON uc.unit_id = l.unit_id
+                 WHERE (l.valid_to IS NULL OR l.valid_to > NOW())
+                   AND COALESCE(u.is_deleted, FALSE) = FALSE
                 """
             )
             cache: Dict[Tuple[str, str], DeviceRegistryEntry] = {}
             for row in cur.fetchall():
-                protocol, uid, priority, device_id, unit_id, sensors_config, hardware, firmware = row
+                protocol, uid, priority, device_id, unit_id, config, hardware, firmware = row
                 key = (str(protocol).lower(), str(uid))
                 cache[key] = DeviceRegistryEntry(
                     unit_id=int(unit_id),
                     priority=int(priority),
                     device_id=int(device_id),
-                    sensors_config=sensors_config,
+                    sensors_config=config,
                     hardware=hardware,
                     firmware=firmware,
                 )

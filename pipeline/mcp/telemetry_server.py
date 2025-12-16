@@ -25,14 +25,9 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from mcp.server.fastmcp import FastMCP
 
 from pipeline.config.defaults import load_from_env
-from pipeline.services.unit_snapshot_v2 import (
-    UnitSnapshotV2Bundle,
-    UnitSnapshotV2Record,
-    UnitSnapshotV2Service,
-)
 from pipeline.storage.latest_metrics import LatestTelemetryStore
 from pipeline.services.shadow_service import ShadowService
-from pipeline.services.device_registry import DeviceRegistry
+from pipeline.services.device_registry import DeviceRegistry, DeviceRegistryEntry
 
 
 log = logging.getLogger("pipeline.mcp.telemetry")
@@ -41,7 +36,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = REPO_ROOT / "data"
 LOGS_DIR = REPO_ROOT / "logs"
 
-SNAPSHOT_V2_PATH = (DATA_DIR / "unit_snapshot.v2.json.gz").resolve()
 LATEST_METRICS_ROOT = (DATA_DIR / "pipeline_storage").resolve()
 STREAM_LOG_PATH = (LOGS_DIR / "stream_runner.log").resolve()
 
@@ -62,20 +56,19 @@ def _ensure_storage_env() -> None:
         os.environ["PIPELINE_STORAGE_ROOT"] = str(LATEST_METRICS_ROOT)
 
 
-def _load_snapshot_bundle() -> UnitSnapshotV2Bundle:
-    service = UnitSnapshotV2Service(snapshot_path=SNAPSHOT_V2_PATH)
-    try:
-        bundle = service.load_bundle()
-    except Exception as exc:  # pragma: no cover - defensive
-        log.warning("telemetry_mcp: failed to load snapshot_v2: %s", exc)
-        return UnitSnapshotV2Bundle.empty()
-    return bundle
-
-
 def _load_latest_store() -> LatestTelemetryStore:
     _ensure_storage_env()
     cfg = load_from_env()
     return LatestTelemetryStore(cfg.storage_root)
+
+
+def _load_registry() -> DeviceRegistry:
+    reg = DeviceRegistry()
+    try:
+        reg.load()
+    except Exception as exc:
+        log.warning("telemetry_mcp: registry load failed: %s", exc)
+    return reg
 
 
 def _read_json_file(path: Path) -> Optional[Mapping[str, Any]]:
@@ -113,28 +106,29 @@ mcp = FastMCP("SMT Telemetry MCP")
 
 @mcp.tool()
 def get_unit_state(unit_id: int) -> Dict[str, Any]:
-    """Return unit state from snapshot_v2 for the given unit_id.
+    """Return unit state from DeviceRegistry + latest_metrics for the given unit."""
 
-    Response:
-        {
-            "found": bool,
-            "snapshot_dump_ts": int | None,
-            "unit": {...}  # UnitSnapshotV2Record.to_dict(), present when found
-        }
-    """
+    reg = _load_registry()
+    entry: Optional[DeviceRegistryEntry] = None
+    for e in reg.iter_entries():
+        if e.unit_id == unit_id:
+            entry = e
+            break
 
-    bundle = _load_snapshot_bundle()
-    record: Optional[UnitSnapshotV2Record] = bundle.units.get(int(unit_id)) if bundle.units else None
-    if not record:
-        return {
-            "found": False,
-            "snapshot_dump_ts": bundle.dump_ts,
-            "unit": None,
-        }
+    latest_store = _load_latest_store()
+    latest = latest_store.get_latest_metrics(unit_id)
+
     return {
-        "found": True,
-        "snapshot_dump_ts": bundle.dump_ts,
-        "unit": record.to_dict(),
+        "found": entry is not None,
+        "unit": {
+            "unit_id": entry.unit_id,
+            "device_id": entry.device_id,
+            "priority": entry.priority,
+            "hardware": entry.hardware,
+            "firmware": entry.firmware,
+            "sensors_config": entry.sensors_config,
+        } if entry else None,
+        "latest": latest,
     }
 
 

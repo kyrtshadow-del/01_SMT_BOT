@@ -33,8 +33,10 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class WialonIPSStreamAdapter(StreamAdapter, MetricsMixin):
-    raw_storage: object  # kept for compatibility, not used in raw mode
-    latest_store: object | None  # kept for compatibility, not used in raw mode
+    # raw_storage/latest_store kept for backwards compatibility with providers/tests,
+    # but persistence is done by the stream runner via PipelineStorageService.
+    raw_storage: object | None = None
+    latest_store: object | None = None
     host: str = "0.0.0.0"
     port: int = 18081
     password: str | None = None
@@ -55,7 +57,6 @@ class WialonIPSStreamAdapter(StreamAdapter, MetricsMixin):
     _max_speed: float = field(default=400.0, init=False, repr=False)
     _max_future_sec: int = field(default=7200, init=False, repr=False)  # 2h guard after timezone normalization
     _max_age_sec: int = field(default=86400 * 30, init=False, repr=False)
-    _storage_root: Path = field(default_factory=lambda: Path("data/pipeline_storage"), init=False, repr=False)
     _tz_warned_uids: set[str] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -66,9 +67,6 @@ class WialonIPSStreamAdapter(StreamAdapter, MetricsMixin):
         self._setup_logging()
         self._prom_path = Path("logs/wialon_ips_ingest.prom")
         self._load_dynamic_limits()
-        raw_root = getattr(self.raw_storage, "root", None)
-        if raw_root:
-            self._storage_root = Path(raw_root)
 
     def _load_dynamic_limits(self) -> None:
         import os
@@ -130,6 +128,15 @@ class WialonIPSStreamAdapter(StreamAdapter, MetricsMixin):
                         continue
                     self._ingest_logger.info("peer=%s line=%s", peer, line)
                     reply, context_uid = self._process_line(line, context_uid, peer_ip)
+
+                    # Если reply=None, рвём соединение, чтобы трекер заново прислал #L#
+                    if reply is None:
+                        self._ingest_logger.warning(
+                            "Closing connection for %s due to protocol error/no auth", peer_ip
+                        )
+                        buffer = ""
+                        break
+
                     if reply:
                         writer.write(reply.encode())
                         await writer.drain()
@@ -140,12 +147,13 @@ class WialonIPSStreamAdapter(StreamAdapter, MetricsMixin):
                 writer.close()
                 await writer.wait_closed()
 
-    def _process_line(self, line: str, context_uid: str | None, peer_ip: str | None) -> tuple[str, str | None]:
+    def _process_line(self, line: str, context_uid: str | None, peer_ip: str | None) -> tuple[str | None, str | None]:
         # Login
         if line.startswith("#L#"):
             parts = line[3:].split(";")
             uid = parts[0] if parts else None
             pwd = parts[1] if len(parts) > 1 else None
+            self._ingest_logger.info("LOGIN peer=%s uid=%s", peer_ip, uid)
             if self.password and pwd != self.password:
                 return "AL#\r\n", context_uid
             context_uid = uid
@@ -157,11 +165,55 @@ class WialonIPSStreamAdapter(StreamAdapter, MetricsMixin):
 
         if line.startswith("#D#") or line.startswith("#SD#"):
             body = line[3:] if line.startswith("#D#") else line[4:]
+
+            # Сначала парсим пакет, пытаясь извлечь UID прямо из данных
             packet = self._parse_data(body, context_uid, peer_ip)
+
             if packet:
+                # Если в данных нашли UID, восстанавливаем контекст
+                new_uid = packet.uid or context_uid
+                if not new_uid:
+                    # нет UID даже после парсинга
+                    self._ingest_logger.warning(
+                        "REJECT: No ID in data after parse. peer=%s raw=%s", peer_ip, line[:160]
+                    )
+                    return None, None
+
+                if not context_uid:
+                    context_uid = new_uid
+                    self._ingest_logger.info("Context RESTORED from data packet uid=%s", context_uid)
+
+                # Если uid пакета отличается от контекста, создаём новый RawPacket (dataclass frozen)
+                if packet.uid != context_uid:
+                    from pipeline.events import RawPacket
+
+                    packet = RawPacket(
+                        protocol=packet.protocol,
+                        uid=context_uid,
+                        device_ts=packet.device_ts,
+                        received_ts=packet.received_ts,
+                        latitude=packet.latitude,
+                        longitude=packet.longitude,
+                        speed=packet.speed,
+                        course=packet.course,
+                        params=packet.params,
+                        raw_payload=packet.raw_payload,
+                        ip=packet.ip,
+                    )
+
                 self._queue.put_nowait(packet)
-                self._last_uid = context_uid or packet.uid
+                self._last_uid = context_uid
                 self._last_event_ts = packet.device_ts
+                return "OK\r\n", context_uid
+
+            # Не смогли определить UID и нет контекста — просим переподключиться
+            if not context_uid:
+                self._ingest_logger.warning(
+                    "REJECT: No ID in data & no context. peer=%s raw=%s", peer_ip, line[:160]
+                )
+                return None, None
+
+            # Контекст есть, но пакет битый — просто ACK
             return "OK\r\n", context_uid
 
         # Unknown packet: acknowledge to keep device happy
@@ -277,7 +329,8 @@ class WialonIPSStreamAdapter(StreamAdapter, MetricsMixin):
             self._anomaly_events += 1
             self.incr_metric("wialon_ips_anomaly_events_total", 1)
 
-        uid = params.get("imei") or context_uid
+        # Восстанавливаем UID из разных вариантов: imei / id / uid
+        uid = params.get("imei") or params.get("id") or params.get("uid") or context_uid
         if not uid:
             return None
 
@@ -472,66 +525,3 @@ class WialonIPSStreamAdapter(StreamAdapter, MetricsMixin):
         if hemi in {"S", "W"}:
             decimal = -decimal
         return decimal
-
-    @staticmethod
-    def _day_key(ts: int) -> str:
-        return dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
-
-    def _persist(self, events: list[Event]) -> None:
-        if not events:
-            return
-        day_key = self._day_key(events[0].device_ts)
-        root = self._storage_root
-        try:
-            if hasattr(self.raw_storage, "append"):
-                written = self.raw_storage.append(day_key, events)  # type: ignore[attr-defined]
-                self._ingest_logger.info(
-                    "persist: day=%s root=%s count=%s written=%s",
-                    day_key,
-                    root,
-                    len(events),
-                    written,
-                )
-                if written != len(events):
-                    self._ingest_logger.debug(
-                        "persist: dedup day=%s written=%s/%s root=%s",
-                        day_key,
-                        written,
-                        len(events),
-                        root,
-                    )
-            else:
-                self._persist_fallback(root, day_key, events)
-        except Exception as exc:
-            self._ingest_logger.error(
-                "persist: failed day=%s root=%s err=%s",
-                day_key,
-                root,
-                exc,
-                exc_info=True,
-            )
-            return
-
-        if self.latest_store:
-            try:
-                self.latest_store.update_from_events(events)
-            except Exception as exc:
-                self._ingest_logger.error(
-                    "persist: latest_store update failed day=%s root=%s err=%s",
-                    day_key,
-                    root,
-                    exc,
-                    exc_info=True,
-                )
-
-    def _persist_fallback(self, root: Path, day_key: str, events: list[Event]) -> None:
-        """File append path when RawStorage is not available."""
-        import json
-
-        day_dir = Path(root) / day_key
-        day_dir.mkdir(parents=True, exist_ok=True)
-        fp = day_dir / "events.jsonl"
-        payload = "\n".join(json.dumps(ev.as_dict(), ensure_ascii=False) for ev in events) + "\n"
-        with fp.open("a", encoding="utf-8") as fh:
-            fh.write(payload)
-        self._ingest_logger.info("persist: fallback day=%s root=%s count=%s", day_key, root, len(events))

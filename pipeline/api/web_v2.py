@@ -10,18 +10,13 @@ import logging.handlers
 from dataclasses import asdict
 from pathlib import Path
 from threading import Lock
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
 
 from fastapi import APIRouter, HTTPException, Request, Depends
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 import psycopg
 
-from pipeline.services.unit_snapshot_v2 import (
-    get_unit_snapshot_v2_service,
-    build_snapshot_v2_bundle,
-)
 from pipeline.services.storage_service import get_pipeline_storage_service
 from pipeline.config.unit_config_service import load_default_service, UnitConfigService
 from pipeline.config.unit_config import UnitConfig
@@ -38,17 +33,10 @@ MAX_RECENT_EVENTS = 3
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 STATIC_DIR = BASE_DIR / "web" / "static"
-TEMPLATES_DIR = BASE_DIR / "web" / "templates"
 SESSION_DIR = BASE_DIR / "data" / "web_v2_sessions"
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-HEALTH_FILES = [
-    LOG_DIR / "galileosky_ingest_health.json",
-    LOG_DIR / "wialon_ips_ingest_health.json",
-]
-INGEST_HEALTH_TTL_SEC = int(os.getenv("INGEST_HEALTH_TTL_SEC", "900"))
-IGNORE_HEALTH_TS = os.getenv("INGEST_HEALTH_IGNORE_TS", "0") == "1"
 # feed: минимальная квантовка возраста статуса, чтобы не спамить дельтами каждый тик
 FEED_AGE_BUCKET_SEC = float(os.getenv("FEED_AGE_BUCKET_SEC", "10"))
 SNAPSHOT_V2_REFRESH_SEC = int(os.getenv("SNAPSHOT_V2_REFRESH_SEC", "300"))
@@ -58,8 +46,6 @@ DEVICE_REGISTRY_DSN = (
     or "postgresql://smt_user:smt_password@127.0.0.1:5432/smt_telematics"
 )
 REDIS_URL = os.getenv("REDIS_URL")
-templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
-
 router = APIRouter()
 
 _monitor_log = logging.getLogger("web.monitoring")
@@ -76,7 +62,6 @@ _cfg_service: Optional[UnitConfigService] = None
 _static_version: Optional[str] = None
 _static_mtime: float = 0.0
 _feed_status_cache: Dict[int, tuple] = {}  # unit_id -> signature для отсечения неизменившихся статусов
-_snapshot_updater_started = False
 # cached singletons
 _shadow_service: Optional[ShadowService] = None
 _db_pool_lock = Lock()
@@ -177,6 +162,37 @@ class BindUnitItem(BaseModel):
     name: str
     uid: Optional[str] = None
     reg_number: Optional[str] = None
+
+
+# ----------------------------- Fleet management models -----------------------------
+
+
+class UnitCreate(BaseModel):
+    name: str
+    uid: Optional[str] = None
+    hw_type: Optional[str] = None
+    node_id: Optional[int] = None
+
+
+class UnitUpdate(BaseModel):
+    name: Optional[str] = None
+    uid: Optional[str] = None
+    hw_type: Optional[str] = None
+    node_id: Optional[int] = None
+    is_deleted: Optional[bool] = None
+
+
+class UnitResponse(BaseModel):
+    id: int
+    name: str
+    uid: Optional[str]
+    hw_type: Optional[str]
+    node_id: Optional[int]
+    is_deleted: bool
+
+
+class ConfigUpdate(BaseModel):
+    config: Dict[str, Any] = Field(default_factory=dict)
 
 
 def _safe_int(value: Any) -> Optional[int]:
@@ -294,34 +310,8 @@ def _normalize_list_view(raw: Any) -> ListViewSettings:
 def _get_cfg_svc() -> UnitConfigService:
     global _cfg_service
     if _cfg_service is None:
-        cfg = load_from_env()
-        storage_root = Path(cfg.storage_root).resolve()
-        unit_configs_dir = storage_root / "unit_configs"
-        if not unit_configs_dir.exists():
-            unit_configs_dir.mkdir(parents=True, exist_ok=True)
-        _cfg_service = load_default_service(storage_root)
+        _cfg_service = load_default_service()
     return _cfg_service
-
-
-def _get_snapshot_bundle():
-    """Load snapshot v2, lazily rebuilding if empty/missing."""
-    svc = get_unit_snapshot_v2_service()
-    v2 = svc.load_bundle()
-    if v2 and v2.units:
-        return v2
-    _monitor_log.info("web_v2: snapshot v2 missing/empty -> rebuilding")
-    try:
-        new_bundle = build_snapshot_v2_bundle()
-        if new_bundle.units:
-            svc.refresh(new_bundle.units.values(), source_kind=new_bundle.source_kind, dump_ts=new_bundle.dump_ts)
-            return new_bundle
-        # even if empty, persist to avoid repeated rebuilds per request
-        svc.refresh([], source_kind="auto_empty", dump_ts=new_bundle.dump_ts)
-        return new_bundle
-    except Exception as exc:  # pragma: no cover - defensive
-        _monitor_log.error("web_v2: auto-build snapshot failed: %s", exc)
-        # return empty bundle instead of 503 to let UI load
-        return svc.load_bundle()
 
 
 def _get_static_version() -> str:
@@ -404,70 +394,22 @@ def _link(cur, unit_id: int, device_id: int, priority: int) -> None:
     )
 
 
-def _get_db_conn():
-    import psycopg
-
-    if not DEVICE_REGISTRY_DSN:
-        raise HTTPException(status_code=500, detail="registry DSN not configured")
-    return psycopg.connect(DEVICE_REGISTRY_DSN)
-
-
-async def _snapshot_v2_updater_loop() -> None:
-    """Periodic background rebuild of snapshot v2."""
-    while True:
-        await asyncio.sleep(max(60, SNAPSHOT_V2_REFRESH_SEC))
-        try:
-            _monitor_log.info("web_v2: background snapshot rebuild started")
-            loop = asyncio.get_running_loop()
-            new_bundle = await loop.run_in_executor(None, build_snapshot_v2_bundle)
-            svc = get_unit_snapshot_v2_service()
-            svc.refresh(new_bundle.units.values(), source_kind="background_auto", dump_ts=new_bundle.dump_ts)
-            _monitor_log.info("web_v2: background snapshot rebuilt units=%s", len(new_bundle.units))
-        except Exception as exc:  # pragma: no cover - defensive
-            _monitor_log.error("web_v2: background snapshot rebuild failed: %s", exc)
-
-
-@router.on_event("startup")
-async def _start_snapshot_updater() -> None:
-    global _snapshot_updater_started
-    if _snapshot_updater_started:
-        return
-    _snapshot_updater_started = True
-    asyncio.create_task(_snapshot_v2_updater_loop())
-
-
 def _sources_health_ok() -> bool:
-    """Health is bad only if we have a *fresh* health file explicitly saying not-ok.
-    Stale or missing files are treated as unknown → assume OK.
+    """Simple health check for ingestion sources.
+
+    For now we treat sources as healthy if Postgres is reachable; legacy
+    JSON health files are ignored for core logic.
     """
-    now = time.time()
-    fresh_seen = False
-    for path in HEALTH_FILES:
-        try:
-            mtime = path.stat().st_mtime
-            fresh = now - mtime <= INGEST_HEALTH_TTL_SEC
-            if not fresh:
-                continue
-            fresh_seen = True
-            ok = True
-            try:
-                data = json.loads(path.read_text("utf-8"))
-                ok = bool(data.get("ok", True))
-                ts = data.get("ts")
-                if ts and not IGNORE_HEALTH_TS:
-                    ok = ok and (now - float(ts) <= INGEST_HEALTH_TTL_SEC)
-            except Exception:
-                ok = True
-            if ok:
-                return True
-            # fresh but not ok → keep scanning, but mark as bad unless another fresh ok exists
-            fresh_seen = True
-        except OSError:
-            continue
-    if not fresh_seen:
+
+    try:
+        with _get_db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
         return True
-    # we saw fresh files and none were ok → health bad
-    return False
+    except Exception:
+        # If DB is down, consider health bad so Monitoring can display a clear reason.
+        return False
 
 
 def _bucket(val: Optional[float], step: float) -> Optional[int]:
@@ -801,18 +743,10 @@ async def login(payload: LoginPayload) -> Dict[str, Any]:
     """
 
     storage = get_admin_storage()
-    user = storage.get_user_by_login(payload.login)
-    if user is None:
+    auth = storage.get_user_auth(payload.login)
+    if auth is None:
         raise HTTPException(status_code=401, detail="invalid credentials")
-
-    # Достаём password_hash напрямую из БД, чтобы не расширять User dataclass.
-    conn = storage._ensure_connection()  # type: ignore[attr-defined]
-    cur = conn.cursor()
-    cur.execute("SELECT password_hash FROM users WHERE login = ?", (payload.login,))
-    row = cur.fetchone()
-    if row is None:
-        raise HTTPException(status_code=401, detail="invalid credentials")
-    stored_hash = row["password_hash"]
+    user, stored_hash = auth
     if not isinstance(stored_hash, str) or not verify_password(payload.password, stored_hash):
         raise HTTPException(status_code=401, detail="invalid credentials")
 
@@ -879,11 +813,12 @@ async def admin_summary(session_id: str = Depends(get_session_id)) -> AdminSumma
         )
         for u in storage.list_users()
     ]
-    # unassigned units: those present in snapshot but without owner_node_id
-    bundle = _get_snapshot_bundle()
-    meta = storage.get_unit_meta_many(list(bundle.units.keys()))
-    assigned = {m.unit_id for m in meta if m.owner_node_id is not None}
-    unassigned = [uid for uid in bundle.units.keys() if uid not in assigned][:200]
+    # unassigned units: в реестре без node_id
+    unassigned: List[int] = []
+    with _get_db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM units WHERE node_id IS NULL AND is_deleted = FALSE ORDER BY id DESC LIMIT 200")
+        unassigned = [int(row[0]) for row in cur.fetchall()]
     return AdminSummary(nodes=nodes, users=users, unassigned_units=unassigned)
 
 
@@ -1027,6 +962,99 @@ def _build_descendant_node_ids(nodes: List[AdminNode], root_id: int) -> Set[int]
         result.add(nid)
         stack.extend(children.get(nid, []))
     return result
+
+
+def _fetch_units_from_db(
+    conn,
+    node_ids: Optional[Set[int]] = None,
+    is_admin: bool = False,
+    unit_ids: Optional[Set[int]] = None,
+) -> List[Dict[str, Any]]:
+    """Fetch units + configs directly from Postgres."""
+
+    cur = conn.cursor()
+    sql = """
+        SELECT u.id, u.name, u.uid, u.hw_type, u.node_id, u.is_deleted, uc.config
+        FROM units u
+        LEFT JOIN unit_configs uc ON u.id = uc.unit_id
+        WHERE 1=1
+    """
+    params: List[Any] = []
+
+    if not is_admin:
+        sql += " AND u.is_deleted = FALSE"
+
+    if node_ids is not None and not is_admin:
+        if not node_ids:
+            return []
+        placeholders = ",".join(["%s"] * len(node_ids))
+        sql += f" AND u.node_id IN ({placeholders})"
+        params.extend(list(node_ids))
+
+    if unit_ids:
+        placeholders = ",".join(["%s"] * len(unit_ids))
+        sql += f" AND u.id IN ({placeholders})"
+        params.extend(list(unit_ids))
+
+    sql += " ORDER BY u.name ASC"
+    cur.execute(sql, params)
+
+    units: List[Dict[str, Any]] = []
+    for row in cur.fetchall():
+        cfg = row[6] or {}
+        units.append(
+            {
+                "id": row[0],
+                "nm": row[1],
+                "name": row[1],
+                "uid": row[2],
+                "hw": row[3],
+                "node_id": row[4],
+                "is_deleted": row[5],
+                "sensors": cfg.get("sensors", []),
+                "profile": cfg.get("profile", []),
+                "config": cfg,
+                "device": {"uid": row[2], "hardware": row[3]},
+                "unit_id": row[0],
+            }
+        )
+    return units
+
+
+def _fetch_unit_by_id(conn, unit_id: int, is_admin: bool, allowed_nodes: Optional[Set[int]]) -> Dict[str, Any]:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT u.id, u.name, u.uid, u.hw_type, u.node_id, u.is_deleted, uc.config
+        FROM units u
+        LEFT JOIN unit_configs uc ON u.id = uc.unit_id
+        WHERE u.id = %s
+        """,
+        (unit_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="unit not found")
+    if not is_admin:
+        if row[5]:
+            raise HTTPException(status_code=404, detail="unit not found")
+        if allowed_nodes is not None and row[4] not in allowed_nodes:
+            raise HTTPException(status_code=404, detail="unit not found")
+    cfg = row[6] or {}
+    return {
+        "id": row[0],
+        "nm": row[1],
+        "name": row[1],
+        "uid": row[2],
+        "hw": row[3],
+        "node_id": row[4],
+        "is_deleted": row[5],
+        "sensors": cfg.get("sensors", []),
+        "profile": cfg.get("profile", []),
+        "config": cfg,
+        "device": {"uid": row[2], "hardware": row[3]},
+        "unit_id": row[0],
+    }
 
 
 def _compose(
@@ -1411,31 +1439,28 @@ def _build_card_data(snap: Dict[str, Any], latest: Dict[str, Any], cfg_dict: Opt
     )
 
 
-def _recent_events(raw_storage_service, unit_id: int, *, limit: int = 3) -> List[Dict[str, Any]]:
-    """Return last N events for unit across available days (fast path)."""
-    events: List[Dict[str, Any]] = []
+def _recent_events(storage_service, unit_id: int, *, limit: int = 3) -> List[Dict[str, Any]]:
+    """Return last N events for unit from DB."""
+
     limit = min(limit, MAX_RECENT_EVENTS)
-    days = sorted((p.name for p in raw_storage_service.storage_root.iterdir() if p.is_dir() and p.name[:4].isdigit()), reverse=True)
-    for day in days:
-        if len(events) >= limit:
-            break
-        evs = raw_storage_service.raw_storage.fetch(day, unit_id=unit_id)
-        if not evs:
-            continue
-        for ev in reversed(evs):
-            events.append(
-                {
-                    "device_ts": ev.device_ts,
-                    "lat": ev.latitude,
-                    "lon": ev.longitude,
-                    "speed": ev.speed,
-                    "course": ev.course,
-                    "params": ev.params or {},
-                }
-            )
-            if len(events) >= limit:
-                break
-    return events[:limit]
+    now_ts = int(time.time())
+    # Two-day window is usually enough for card tooltip; adjust if needed.
+    start_ts = now_ts - 2 * 86400
+    events = storage_service.fetch_period(unit_id, start_ts, now_ts)
+    if not events:
+        return []
+    recent = list(reversed(events))[:limit]
+    return [
+        {
+            "device_ts": ev.device_ts,
+            "lat": ev.latitude,
+            "lon": ev.longitude,
+            "speed": ev.speed,
+            "course": ev.course,
+            "params": ev.params or {},
+        }
+        for ev in recent
+    ]
 
 
 def _median(values: List[float]) -> Optional[float]:
@@ -1450,143 +1475,13 @@ def _median(values: List[float]) -> Optional[float]:
 
 
 def _adaptive_ignition(storage_service, unit_id: int, current_pwr: Optional[float]) -> Optional[bool]:
-    """Estimate ignition threshold per unit from recent events (похож на Wialon авто-порог).
+    """Adaptive ignition helper (currently disabled).
 
-    - Собираем pwr_ext из последних ~200 событий за 2 дня.
-    - Делим на кластеры по скорости: speed>3 -> "движение", speed<=0.5 -> "стоянка".
-    - Если есть оба кластера и med_on > med_off + delta (env IGNITION_VOLTAGE_DELTA, default 1.0В),
-      ставим пороги on/off = med_on, med_off и threshold=(med_on+med_off)/2.
-    - Возвращаем bool(current_pwr > threshold) или None, если данных нет.
+    Kept for future SQL-based implementation. For now always returns None
+    to avoid slow file-based scans of raw storage.
     """
-    if current_pwr is None:
-        return None
-    try:
-        delta_min = float(os.getenv("IGNITION_VOLTAGE_DELTA", "1.0"))
-    except Exception:
-        delta_min = 1.0
-    days = sorted((p.name for p in storage_service.storage_root.iterdir() if p.is_dir() and p.name[:4].isdigit()), reverse=True)
-    on_vals: List[float] = []
-    off_vals: List[float] = []
-    max_events = 200
-    for day in days[:2]:  # смотрим максимум за 2 дня
-        evs = storage_service.raw_storage.fetch(day, unit_id=unit_id)
-        for ev in reversed(evs):
-            if ev.params is None:
-                continue
-            pwr = ev.params.get("pwr_ext")
-            try:
-                pwr = float(pwr)
-            except Exception:
-                continue
-            spd = ev.speed or 0.0
-            if spd > 3:
-                on_vals.append(pwr)
-            elif spd <= 0.5:
-                off_vals.append(pwr)
-            if len(on_vals) + len(off_vals) >= max_events:
-                break
-        if len(on_vals) + len(off_vals) >= max_events:
-            break
-    med_on = _median(on_vals)
-    med_off = _median(off_vals)
-    if med_on is None or med_off is None:
-        return None
-    if med_on <= med_off + delta_min:  # неубедительно отличает «вкл» от «выкл»
-        return None
-    threshold = (med_on + med_off) / 2
-    _cache_threshold(unit_id, med_on, med_off, threshold)
-    return current_pwr > threshold
 
-
-IGN_CACHE_PATH = Path("data/ignition_cache.json")
-_IGN_CACHE: Optional[Dict[str, Any]] = None
-_IGN_CACHE_LOCK = Lock()
-
-
-def _load_ign_cache() -> Dict[str, Any]:
-    global _IGN_CACHE
-    if _IGN_CACHE is not None:
-        return _IGN_CACHE
-    if IGN_CACHE_PATH.exists():
-        try:
-            _IGN_CACHE = json.loads(IGN_CACHE_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            _IGN_CACHE = {}
-    else:
-        _IGN_CACHE = {}
-    return _IGN_CACHE
-
-
-def _save_ign_cache() -> None:
-    if _IGN_CACHE is None:
-        return
-    try:
-        tmp = IGN_CACHE_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(_IGN_CACHE, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(IGN_CACHE_PATH)
-    except Exception:
-        pass
-
-
-def _cache_threshold(unit_id: int, med_on: float, med_off: float, threshold: float) -> None:
-    cache = _load_ign_cache()
-    cache[str(unit_id)] = {
-        "med_on": med_on,
-        "med_off": med_off,
-        "threshold": threshold,
-        "ts": int(time.time()),
-    }
-    _save_ign_cache()
-
-
-def _get_cached_threshold(unit_id: int, *, max_age_sec: int = 7 * 86400) -> Optional[Dict[str, float]]:
-    cache = _load_ign_cache()
-    entry = cache.get(str(unit_id))
-    if not isinstance(entry, dict):
-        return None
-    ts = entry.get("ts")
-    try:
-        if ts and int(time.time()) - int(ts) > max_age_sec:
-            return None
-    except Exception:
-        return None
-    return entry
-
-
-def _apply_cached_ignition(unit_id: int, latest: Dict[str, Any], status: Dict[str, Any]) -> None:
-    cache = _get_cached_threshold(unit_id)
-    if not cache:
-        return
-    try:
-        pwr = float(_extract_params(latest).get("pwr_ext"))
-    except Exception:
-        pwr = None
-    if pwr is None:
-        return
-    th_on = cache.get("med_on")
-    th_off = cache.get("med_off")
-    th_mid = cache.get("threshold")
-    ign = status.get("ignition")
-    try:
-        if th_on is not None and pwr >= th_on:
-            ign = True
-        elif th_off is not None and pwr <= th_off:
-            ign = False
-        elif th_mid is not None:
-            ign = pwr > th_mid
-    except Exception:
-        pass
-    if ign is None:
-        return
-    status["ignition"] = ign
-    if not status.get("online"):
-        return
-    if status.get("status") == "stop":
-        status["status"] = "park_ign_on" if ign else "park_ign_off"
-        status["status_label"] = "Остановка, зажиг. вкл" if ign else "Остановка, зажиг. выкл"
-    elif status.get("status") == "stopped":
-        # Для длительной стоянки сохраняем статус (нужен для фильтра), но уточняем подпись.
-        status["status_label"] = "Стоянка, зажиг. вкл" if ign else "Стоянка, зажиг. выкл"
+    return None
 
 
 def _has_manual_threshold(cfg_dict: Optional[Dict[str, Any]]) -> bool:
@@ -1596,32 +1491,31 @@ def _has_manual_threshold(cfg_dict: Optional[Dict[str, Any]]) -> bool:
     return "ignition_threshold_v_on" in adv and "ignition_threshold_v_off" in adv
 
 
-@router.get("/monitoring/", response_class=HTMLResponse)
-async def monitoring_page(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse("index.html", {"request": request, "static_version": _get_static_version()})
-
-
-# ----------------------- Shadow / Registry UI API -----------------------
-
-
 @router.get("/api/unknown_devices", response_model=List[UnknownDevice])
 async def list_unknown_devices(session_id: str = Depends(get_session_id)) -> List[UnknownDevice]:
     _require_admin(session_id)
     sh = _get_shadow_service()
-    # Self-healing: убираем из Shadow устройства, которые уже заведены в Registry/snapshot.
-    bundle = _get_snapshot_bundle()
+    # Self-healing: убираем из Shadow устройства, которые уже реально привязаны (unit_device_links + devices)
     known_pairs: set[tuple[str, str]] = set()
-    for rec in bundle.units.values():
-        try:
-            device = rec.device if hasattr(rec, "device") else rec.get("device", {})
-        except Exception:
-            device = {}
-        uid = device.get("uid")
-        if uid:
-            known_pairs.add(("wialon_ips", str(uid)))
-            known_pairs.add(("galileosky", str(uid)))
-            # без протокола — для безопасности
-            known_pairs.add(("", str(uid)))
+    with _get_db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT d.protocol, d.uid
+              FROM unit_device_links l
+              JOIN devices d ON d.id = l.device_id
+              JOIN units u   ON u.id = l.unit_id
+             WHERE COALESCE(u.is_deleted, FALSE) = FALSE
+            """
+        )
+        for proto, uid in cur.fetchall():
+            if not uid:
+                continue
+            uid_str = str(uid)
+            proto_l = (proto or "").lower()
+            if proto_l:
+                known_pairs.add((proto_l, uid_str))
+            known_pairs.add(("", uid_str))  # без протокола — для безопасности
     devices: List[UnknownDevice] = []
     keys = sh.list_keys("shadow:device:*", limit=200)
     for key in keys:
@@ -1665,6 +1559,14 @@ async def list_unknown_devices(session_id: str = Depends(get_session_id)) -> Lis
     return devices
 
 
+@router.get("/api/unknown_devices/count")
+async def unknown_devices_count(session_id: str = Depends(get_session_id)) -> Dict[str, int]:
+    """Return count of unknown devices in Shadow."""
+    _require_admin(session_id)
+    sh = _get_shadow_service()
+    return {"count": sh.get_count()}
+
+
 @router.post("/api/unknown_devices/{protocol}/{uid}/create")
 async def create_and_bind(
     protocol: str,
@@ -1675,19 +1577,56 @@ async def create_and_bind(
     _require_admin(session_id)
     sh = _get_shadow_service()
     with _get_db_conn() as conn:
-        cur = conn.cursor()
-        device_id = _ensure_device(cur, protocol, uid)
-        unit_id = _ensure_unit(cur, body.name)
-        _link(cur, unit_id, device_id, body.priority)
-        conn.commit()
+        with conn.transaction():
+            cur = conn.cursor()
+            # 1) device
+            cur.execute(
+                """
+                INSERT INTO devices (protocol, uid)
+                VALUES (%s, %s)
+                ON CONFLICT (protocol, uid) DO NOTHING
+                RETURNING id
+                """,
+                (protocol, uid),
+            )
+            row = cur.fetchone()
+            if row:
+                device_id = int(row[0])
+            else:
+                cur.execute("SELECT id FROM devices WHERE protocol=%s AND uid=%s", (protocol, uid))
+                device_id = int(cur.fetchone()[0])
+
+            # 2) unit (fill uid/hw_type for UI) с upsert по uid
+            cur.execute(
+                """
+                INSERT INTO units (name, uid, hw_type)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (uid) DO UPDATE
+                  SET name = EXCLUDED.name,
+                      hw_type = EXCLUDED.hw_type,
+                      updated_at = NOW()
+                RETURNING id
+                """,
+                (body.name, uid, protocol),
+            )
+            unit_id = int(cur.fetchone()[0])
+
+            # 3) link
+            cur.execute(
+                """
+                INSERT INTO unit_device_links (unit_id, device_id, priority)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (unit_id, device_id) DO NOTHING
+                """,
+                (unit_id, device_id, body.priority),
+            )
+
+            # 4) ensure config exists
+            cur.execute(
+                "INSERT INTO unit_configs (unit_id, config) VALUES (%s, '{}'::jsonb) ON CONFLICT DO NOTHING",
+                (unit_id,),
+            )
     sh.delete(f"shadow:device:{protocol}:{uid}")
-    # trigger snapshot v2 rebuild so юнит появился в основном списке
-    try:
-        bundle = build_snapshot_v2_bundle()
-        svc = get_unit_snapshot_v2_service()
-        svc.refresh(bundle.units.values(), source_kind=bundle.source_kind, dump_ts=bundle.dump_ts)
-    except Exception as exc:
-        _monitor_log.warning("shadow create: snapshot rebuild failed: %s", exc)
     return {"status": "ok", "unit_id": unit_id, "device_id": device_id}
 
 
@@ -1701,17 +1640,47 @@ async def bind_unknown_device(
     _require_admin(session_id)
     sh = _get_shadow_service()
     with _get_db_conn() as conn:
-        cur = conn.cursor()
-        device_id = _ensure_device(cur, protocol, uid)
-        _link(cur, body.unit_id, device_id, body.priority)
-        conn.commit()
+        with conn.transaction():
+            cur = conn.cursor()
+            # 1) ensure device
+            cur.execute(
+                """
+                INSERT INTO devices (protocol, uid)
+                VALUES (%s, %s)
+                ON CONFLICT (protocol, uid) DO NOTHING
+                RETURNING id
+                """,
+                (protocol, uid),
+            )
+            row = cur.fetchone()
+            if row:
+                device_id = int(row[0])
+            else:
+                cur.execute("SELECT id FROM devices WHERE protocol=%s AND uid=%s", (protocol, uid))
+                device_id = int(cur.fetchone()[0])
+
+            # 2) link
+            cur.execute(
+                """
+                INSERT INTO unit_device_links (unit_id, device_id, priority)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (unit_id, device_id) DO NOTHING
+                """,
+                (body.unit_id, device_id, body.priority),
+            )
+
+            # 3) update legacy fields for UI
+            cur.execute(
+                "UPDATE units SET uid=%s, hw_type=%s WHERE id=%s",
+                (uid, protocol, body.unit_id),
+            )
+
+            # 4) ensure config
+            cur.execute(
+                "INSERT INTO unit_configs (unit_id, config) VALUES (%s, '{}'::jsonb) ON CONFLICT DO NOTHING",
+                (body.unit_id,),
+            )
     sh.delete(f"shadow:device:{protocol}:{uid}")
-    try:
-        bundle = build_snapshot_v2_bundle()
-        svc = get_unit_snapshot_v2_service()
-        svc.refresh(bundle.units.values(), source_kind=bundle.source_kind, dump_ts=bundle.dump_ts)
-    except Exception as exc:
-        _monitor_log.warning("shadow bind: snapshot rebuild failed: %s", exc)
     return {"status": "ok"}
 
 
@@ -1734,33 +1703,26 @@ async def search_units_admin(
     limit: int = 50,
     session_id: str = Depends(get_session_id),
 ) -> List[BindUnitItem]:
-    """Поиск юнитов для привязки UnknownDevice (Inbox). Основан на snapshot v2, чтобы не ходить в БД за каждым поиском."""
-    bundle = _get_snapshot_bundle()
+    _require_admin(session_id)
     if not q:
         return []
     ql = q.lower()
-    items: List[BindUnitItem] = []
-    for uid, rec in bundle.units.items():
-        hay = [
-            rec.name or "",
-            rec.reg_number or "",
-            rec.device.get("uid") or "",
-            str(rec.unit_id),
-        ]
-        hay_lc = [str(h).lower() for h in hay if h is not None]
-        if any(ql in h for h in hay_lc):
-            items.append(
-                BindUnitItem(
-                    id=int(rec.unit_id),
-                    name=rec.name or f"unit {rec.unit_id}",
-                    uid=str(rec.device.get("uid")) if rec.device else None,
-                    reg_number=rec.reg_number,
-                )
-            )
-        if len(items) >= limit:
-            break
-    return items
-
+    results: List[BindUnitItem] = []
+    with _get_db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, name, uid
+            FROM units
+            WHERE is_deleted = FALSE AND (LOWER(name) LIKE %s OR LOWER(uid) LIKE %s)
+            ORDER BY name ASC
+            LIMIT %s
+            """,
+            (f"%{ql}%", f"%{ql}%", limit),
+        )
+        for row in cur.fetchall():
+            results.append(BindUnitItem(id=row[0], name=row[1], uid=row[2], reg_number=None))
+    return results
 
 @router.get("/api/units", response_model=List[UnitListItem])
 async def list_units(
@@ -1771,107 +1733,60 @@ async def list_units(
     cursor: Optional[int] = None,
     session_id: str = Depends(get_session_id),
 ) -> List[UnitListItem]:
-    bundle = _get_snapshot_bundle()
     storage = get_pipeline_storage_service()
     items: List[UnitListItem] = []
     q_lc = q.lower() if q else None
-    totals = {
-        "units_total": len(bundle.units),
-        "online_total": 0,
-        "offline_total": 0,
-        "missing_latest": 0,
-        "stale_over_threshold": 0,
-    }
-    filtered = {"units_matched": 0, "online": 0, "offline": 0}
-    sample_offline: List[Dict[str, Any]] = []
     now = int(time.time())
     threshold = get_online_threshold()
     health_ok = _sources_health_ok()
-    # Hierarchy / visibility: resolve current user's node and allowed units.
     node_id, is_admin = _get_access_context(session_id)
     admin_storage = get_admin_storage()
-    unit_ids = list(bundle.units.keys())
-    unit_meta_list = admin_storage.get_unit_meta_many(unit_ids)
-    meta_by_unit: Dict[int, AdminUnitMeta] = {m.unit_id: m for m in unit_meta_list}
     nodes = admin_storage.list_nodes()
     allowed_nodes: Optional[Set[int]] = None
     if not is_admin and node_id is not None and nodes:
         allowed_nodes = _build_descendant_node_ids(nodes, node_id)
 
-    def _unwrap(rec: Any) -> Dict[str, Any]:
-        if hasattr(rec, "to_dict"):
-            return rec.to_dict()  # UnitSnapshotV2Record or legacy record
-        return dict(rec)
-
-    for uid, rec in bundle.units.items():
-        snap = _unwrap(rec)
-        meta = meta_by_unit.get(uid)
-        owner_node_id = meta.owner_node_id if meta else snap.get("owner_node_id")
-        is_deleted = bool(meta.is_deleted) if meta else bool(snap.get("is_deleted"))
-        # Visibility: hide deleted units for non-admins, and units outside subtree.
-        if not is_admin and is_deleted:
-            continue
-        if allowed_nodes is not None:
-            if owner_node_id is None or owner_node_id not in allowed_nodes:
+    with _get_db_conn() as conn:
+        db_units = _fetch_units_from_db(conn, allowed_nodes, is_admin)
+        for u in db_units:
+            unit_id = u["id"]
+            unit_name = u.get("nm") or u.get("name") or ""
+            unit_uid = u.get("uid") or ""
+            if q_lc and q_lc not in unit_name.lower() and q_lc not in unit_uid.lower():
                 continue
-        raw_latest = storage.get_latest_metrics(uid)
-        latest = raw_latest or snap.get("latest") or {}
-        status = compute_status(snap, latest, unit_config=None, unit_id=uid, now=now, health_ok=health_ok)
-        if status.get("ignition") is None and not _has_manual_threshold(None):
-            _apply_cached_ignition(uid, latest, status)
-        age_sec = _age_seconds(status.get("last_ts"), now=now)
-        has_latest = raw_latest is not None
-        offline_reason = None
-        if status.get("online"):
-            totals["online_total"] += 1
-        else:
-            totals["offline_total"] += 1
-            if not has_latest:
-                totals["missing_latest"] += 1
-            elif age_sec is not None and age_sec > threshold:
-                totals["stale_over_threshold"] += 1
-            offline_reason = _format_offline_reason(has_latest, age_sec, threshold)
-            if len(sample_offline) < 3:
-                sample_offline.append({"id": uid, "age_sec": age_sec, "reason": offline_reason})
-        unit_name = snap.get("nm") or snap.get("name") or ""
-        unit_uid = snap.get("uid") or (snap.get("device") or {}).get("uid") or ""
-        if q_lc and q_lc not in unit_name.lower() and q_lc not in unit_uid.lower():
-            continue
-        unit_online = bool(status.get("online"))
-        if online is not None and unit_online != online:
-            continue
-        unit_has_fuel = bool(status.get("has_fuel"))
-        if has_fuel is not None and unit_has_fuel != has_fuel:
-            continue
-        filtered["units_matched"] += 1
-        if status.get("online"):
-            filtered["online"] += 1
-        else:
-            filtered["offline"] += 1
-        tags = _collect_sensor_tags(snap, None)
-        item = _compose(
-            uid,
-            snap,
-            latest,
-            status,
-            offline_reason=offline_reason,
-            last_ts_age_sec=age_sec,
-            sensor_tags=tags,
-        )
-        items.append(item)
-    items.sort(key=lambda u: (not u.online, u.name.lower()))
-    _log_units_snapshot(
-        {
-            "event": "list_units",
-            "filters": {"q": q, "online": online, "has_fuel": has_fuel},
-            "totals": totals,
-            "filtered": filtered,
-            "sample_offline": sample_offline,
-            "threshold_sec": threshold,
-        }
-    )
-    return items
 
+            raw_latest = storage.get_latest_metrics(unit_id)
+            latest = raw_latest or {}
+            status = compute_status(u, latest, unit_config=None, unit_id=unit_id, now=now, health_ok=health_ok)
+            age_sec = _age_seconds(status.get("last_ts"), now=now)
+            offline_reason = None
+            has_latest = raw_latest is not None
+            if not status.get("online"):
+                offline_reason = _format_offline_reason(has_latest, age_sec, threshold)
+
+            unit_online = bool(status.get("online"))
+            if online is not None and unit_online != online:
+                continue
+            unit_has_fuel = bool(status.get("has_fuel"))
+            if has_fuel is not None and unit_has_fuel != has_fuel:
+                continue
+
+            tags = _collect_sensor_tags(u, None)
+            item = _compose(
+                unit_id,
+                u,
+                latest,
+                status,
+                offline_reason=offline_reason,
+                last_ts_age_sec=age_sec,
+                sensor_tags=tags,
+            )
+            items.append(item)
+
+    if limit:
+        items = items[:limit]
+    items.sort(key=lambda u: (not u.online, u.name.lower()))
+    return items
 
 @router.get("/api/units/feed", response_model=UnitFeedResponse)
 async def units_feed(
@@ -1880,117 +1795,98 @@ async def units_feed(
     session_id: str = Depends(get_session_id),
 ) -> UnitFeedResponse:
     storage = get_pipeline_storage_service()
-    bundle = _get_snapshot_bundle()
     now_ts = time.time()
+
     watch_set: Optional[Set[int]] = None
     if watch_ids:
         try:
             watch_set = {int(x) for x in watch_ids.split(",") if x.strip().isdigit()}
         except Exception:
             watch_set = None
+
     node_id, is_admin = _get_access_context(session_id)
     admin_storage = get_admin_storage()
-    unit_ids = list(bundle.units.keys())
-    unit_meta_list = admin_storage.get_unit_meta_many(unit_ids)
-    meta_by_unit: Dict[int, AdminUnitMeta] = {m.unit_id: m for m in unit_meta_list}
     nodes = admin_storage.list_nodes()
     allowed_nodes: Optional[Set[int]] = None
     if not is_admin and node_id is not None and nodes:
         allowed_nodes = _build_descendant_node_ids(nodes, node_id)
+
     now = int(time.time())
     threshold = get_online_threshold()
     health_ok = _sources_health_ok()
     updates: List[UnitFeedItem] = []
-    for uid, rec in bundle.units.items():
-        snap = rec.to_dict() if hasattr(rec, "to_dict") else dict(rec)
-        meta = meta_by_unit.get(uid)
-        owner_node_id = meta.owner_node_id if meta else None
-        is_deleted = bool(meta.is_deleted) if meta else False
-        if not is_admin and is_deleted:
-            continue
-        if allowed_nodes is not None:
-            if owner_node_id is None or owner_node_id not in allowed_nodes:
+
+    with _get_db_conn() as conn:
+        db_units = _fetch_units_from_db(conn, allowed_nodes, is_admin, unit_ids=watch_set)
+        for u in db_units:
+            uid = u["id"]
+            raw_latest = storage.get_latest_metrics(uid)
+            latest = raw_latest or {}
+            status = compute_status(u, latest, unit_config=None, unit_id=uid, now=now, health_ok=health_ok)
+            age_sec = _age_seconds(status.get("last_ts"), now=now)
+            coords = _resolve_coords(latest, u)
+            offline_reason = None
+            if not status.get("online"):
+                offline_reason = _format_offline_reason(raw_latest is not None, age_sec, threshold)
+
+            signature = _status_signature(status, coords, offline_reason, latest.get("speed"))
+            prev = _feed_status_cache.get(uid)
+            if prev == signature:
                 continue
-        if watch_set is not None and uid not in watch_set:
-            continue
-        raw_latest = storage.get_latest_metrics(uid)
-        latest = raw_latest or {}
-        status = compute_status(snap, latest, unit_config=None, unit_id=uid, now=now, health_ok=health_ok)
-        if status.get("ignition") is None and not _has_manual_threshold(None):
-            _apply_cached_ignition(uid, latest, status)
-        age_sec = _age_seconds(status.get("last_ts"), now=now)
-        coords = _resolve_coords(latest, snap)
-        offline_reason = None
-        if not status.get("online"):
-            offline_reason = _format_offline_reason(raw_latest is not None, age_sec, threshold)
-        signature = _status_signature(status, coords, offline_reason, latest.get("speed"))
-        prev = _feed_status_cache.get(uid)
-        if prev == signature:
-            continue
-        _feed_status_cache[uid] = signature
-        tooltip = _build_tooltip_data(status, latest, snap)
-        updates.append(
-            UnitFeedItem(
-                id=uid,
-                online=status.get("online", False),
-                status=status.get("status", "offline"),
-                status_label=status.get("status_label", "Нет связи"),
-                ignition=status.get("ignition"),
-                last_ts=status.get("last_ts"),
-                last_ts_age_sec=age_sec,
-                stop_duration_s=status.get("stop_duration_s"),
-                lat=coords[0],
-                lon=coords[1],
-                speed=latest.get("speed"),
-                has_fuel=status.get("has_fuel", False),
-                offline_reason=offline_reason,
-                tooltip_data=tooltip,
-                reason=status.get("reason"),
+            _feed_status_cache[uid] = signature
+
+            tooltip = _build_tooltip_data(status, latest, u)
+            updates.append(
+                UnitFeedItem(
+                    id=uid,
+                    online=status.get("online", False),
+                    status=status.get("status", "offline"),
+                    status_label=status.get("status_label", "Нет связи"),
+                    ignition=status.get("ignition"),
+                    last_ts=status.get("last_ts"),
+                    last_ts_age_sec=age_sec,
+                    stop_duration_s=status.get("stop_duration_s"),
+                    lat=coords[0],
+                    lon=coords[1],
+                    speed=latest.get("speed"),
+                    has_fuel=status.get("has_fuel", False),
+                    offline_reason=offline_reason,
+                    tooltip_data=tooltip,
+                    reason=status.get("reason"),
+                )
             )
-        )
+
     shadow_count = _get_shadow_service().get_count()
     return UnitFeedResponse(ts=now_ts, updates=updates, reset=False, shadow_count=shadow_count)
 
-
 @router.get("/api/units/{unit_id}", response_model=UnitDetail)
 async def unit_detail(unit_id: int, session_id: str = Depends(get_session_id)) -> UnitDetail:
-    bundle = _get_snapshot_bundle()
-    rec = bundle.units.get(unit_id)
-    if not rec:
-        raise HTTPException(status_code=404, detail="unit not found")
     node_id, is_admin = _get_access_context(session_id)
     admin_storage = get_admin_storage()
-    meta_list = admin_storage.get_unit_meta_many([unit_id])
-    meta = meta_list[0] if meta_list else None
-    owner_node_id = meta.owner_node_id if meta else None
-    is_deleted = bool(meta.is_deleted) if meta else False
-    nodes = admin_storage.list_nodes()
     allowed_nodes: Optional[Set[int]] = None
-    if not is_admin and node_id is not None and nodes:
+    if not is_admin and node_id is not None:
+        nodes = admin_storage.list_nodes()
         allowed_nodes = _build_descendant_node_ids(nodes, node_id)
-    if not is_admin:
-        if is_deleted:
-            raise HTTPException(status_code=404, detail="unit not found")
-        if allowed_nodes is not None and (owner_node_id is None or owner_node_id not in allowed_nodes):
-            raise HTTPException(status_code=404, detail="unit not found")
-    snap = rec.to_dict() if hasattr(rec, "to_dict") else dict(rec)
+
+    with _get_db_conn() as conn:
+        snap = _fetch_unit_by_id(conn, unit_id, is_admin=is_admin, allowed_nodes=allowed_nodes)
+        cfg_dict = snap.get("config") or {}
+
     storage = get_pipeline_storage_service()
     raw_latest = storage.get_latest_metrics(unit_id)
-    latest = raw_latest or snap.get("latest") or {}
-    cfg_dict = None
-    try:
-        cfg = _get_cfg_svc().load(unit_id)
-        cfg_dict = asdict(cfg)
-    except Exception:
-        cfg_dict = None
+    latest = raw_latest or {}
+
     threshold = get_online_threshold()
     health_ok = _sources_health_ok()
     status = compute_status(snap, latest, unit_config=cfg_dict, unit_id=unit_id, health_ok=health_ok)
+
     age_sec = _age_seconds(status.get("last_ts"))
     offline_reason = None
     if not status.get("online"):
         offline_reason = _format_offline_reason(raw_latest is not None, age_sec, threshold)
+
     sensor_tags = _collect_sensor_tags(snap, cfg_dict)
+
     item = _compose(
         unit_id,
         snap,
@@ -2000,25 +1896,12 @@ async def unit_detail(unit_id: int, session_id: str = Depends(get_session_id)) -
         last_ts_age_sec=age_sec,
         sensor_tags=sensor_tags,
     )
+
     tooltip = _build_tooltip_data(status, latest, snap)
-    # Adaptive ignition threshold if not determined and manual thresholds absent
-    if status.get("ignition") is None and not _has_manual_threshold(cfg_dict):
-        pwr = None
-        try:
-            pwr = float(_extract_params(latest).get("pwr_ext"))
-        except Exception:
-            pwr = None
-        adaptive_ign = _adaptive_ignition(storage, unit_id, pwr)
-        if adaptive_ign is not None:
-            status["ignition"] = adaptive_ign
-            if status.get("status") == "stop":
-                status["status"] = "park_ign_on" if adaptive_ign else "park_ign_off"
-                status["status_label"] = "Остановка, зажиг. вкл" if adaptive_ign else "Остановка, зажиг. выкл"
-            elif status.get("status") == "stopped":
-                status["status_label"] = "Стоянка, зажиг. вкл" if adaptive_ign else "Стоянка, зажиг. выкл"
     card = _build_card_data(snap, latest, cfg_dict, status)
     filter_options = _build_filter_options(snap, latest, cfg_dict)
     recent = _recent_events(storage, unit_id, limit=3)
+
     return UnitDetail(
         item=item,
         snapshot=snap,
@@ -2030,7 +1913,6 @@ async def unit_detail(unit_id: int, session_id: str = Depends(get_session_id)) -
         filter_options=filter_options,
         recent_events=recent,
     )
-
 
 def _load_worklist(session_id: str) -> List[int]:
     doc = _load_session(session_id)
@@ -2054,22 +1936,26 @@ async def worklist_get(session_id: str = Depends(get_session_id)) -> List[int]:
 
 @router.post("/api/worklist", response_model=List[int])
 async def worklist_add(payload: WorklistPayload, session_id: str = Depends(get_session_id)) -> List[int]:
-    bundle = _get_snapshot_bundle()
     current = _load_worklist(session_id)
-    for uid in payload.unit_ids:
-        if uid not in bundle.units:
-            raise HTTPException(status_code=404, detail=f"unit {uid} not found")
-        if uid not in current:
-            current.append(uid)
+    with _get_db_conn() as conn:
+        cur = conn.cursor()
+        for uid in payload.unit_ids:
+            cur.execute("SELECT 1 FROM units WHERE id=%s AND is_deleted=FALSE", (uid,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail=f"unit {uid} not found")
+            if uid not in current:
+                current.append(uid)
     return _save_worklist(session_id, current)
 
 
 @router.put("/api/worklist", response_model=List[int])
 async def worklist_replace(payload: WorklistPayload, session_id: str = Depends(get_session_id)) -> List[int]:
-    bundle = _get_snapshot_bundle()
-    for uid in payload.unit_ids:
-        if uid not in bundle.units:
-            raise HTTPException(status_code=404, detail=f"unit {uid} not found")
+    with _get_db_conn() as conn:
+        cur = conn.cursor()
+        for uid in payload.unit_ids:
+            cur.execute("SELECT 1 FROM units WHERE id=%s AND is_deleted=FALSE", (uid,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail=f"unit {uid} not found")
     return _save_worklist(session_id, payload.unit_ids)
 
 
@@ -2205,6 +2091,43 @@ async def api_history_trips(unit_id: int, from_ts: int, to_ts: int, session_id: 
         _monitor_log.error("trips API failed: %s", exc)
         raise HTTPException(status_code=500, detail="database error")
     return results
+
+
+@router.get("/api/history/calendar", response_model=Dict[str, int])
+async def api_history_calendar(unit_id: int, month: str, session_id: str = Depends(get_session_id)) -> Dict[str, int]:
+    """Календарь активности: пробег по дням за месяц.
+
+    month: формат YYYY-MM (локальное время сервера, используем timestamp).
+    """
+
+    _get_access_context(session_id)
+
+    try:
+        dt = datetime.strptime(month, "%Y-%m")
+        start_ts = int(dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
+        end_ts = int((dt.replace(day=28) + timedelta(days=4)).replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid month format YYYY-MM")
+
+    data: Dict[str, int] = {}
+    query = """
+        SELECT to_char(start_ts, 'YYYY-MM-DD') AS day, SUM(distance_m) AS dist
+        FROM trips
+        WHERE unit_id = %s AND start_ts >= %s AND start_ts < %s
+        GROUP BY 1
+    """
+
+    try:
+        with _get_db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(query, (unit_id, datetime.fromtimestamp(start_ts), datetime.fromtimestamp(end_ts)))
+            for day, dist in cur.fetchall():
+                data[day] = int(dist or 0)
+    except Exception as exc:
+        _monitor_log.error("history calendar failed: %s", exc)
+        raise HTTPException(status_code=500, detail="database error")
+
+    return data
 
 
 @router.get("/api/history/track", response_model=List[TrackPoint])

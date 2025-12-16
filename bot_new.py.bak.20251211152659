@@ -1,0 +1,4597 @@
+# -*- coding: utf-8 -*-
+"""\nТелеграм-бот для внесения произвольных полей, показа статистики (ДУТ) и отправки команд (TCP) в Wialon.\n\nЛОГИКА:\n— Внизу только реплай-кнопка: «🔍 Найти объект».\n— Всегда сначала поиск → карточка статистики отдельным сообщением.\n— Под карточкой инлайн-кнопки упорядочены построчно: «📑 Отчёт» + «📍 Ближайшие объекты»,\n  ниже строка «📡 Команда» + «⚙️ Параметры», затем одиночные «📝 Произвольные поля»\n  и «📊 Анализ Сливов», и внизу «🔄 Обновить» + «↩️ К списку».\n— При переходе к «полям» или «команде» кнопки под карточкой скрываются (карточка остаётся).\n— «Назад» под карточкой удаляет карточку и возвращает к поиску.\n— «🔍 Найти объект» на любом шаге сбрасывает цепочку и начинает поиск заново.\n— Финальные сообщения «Готово…» и «Команда отправлена…» НЕ удаляются.\n— «Отмена» в отправке команды — завершает диалог.\n— После завершения диалога ЛЮБОЕ новое текстовое сообщение снова запускает поиск (через entry_point).\n— Жёсткая причина «Text must be non-empty» убрана.\n"""
+import asyncio
+import contextlib
+import copy
+import functools
+import gzip
+import html
+import io
+import json
+import logging
+import logging.handlers
+import math
+import inspect
+import os
+import traceback
+import pathlib
+from pathlib import Path
+import random
+import re
+import sqlite3
+import statistics
+import sys
+import threading
+import time
+import uuid
+import shutil
+import zipfile
+from collections import deque
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, TypeVar, Union, Deque, Mapping
+from datetime import date, datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+from urllib.parse import urlencode, quote_plus, urlsplit
+
+from dataclasses import dataclass, field
+
+import requests
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+from requests.adapters import HTTPAdapter
+
+import httpx
+
+from dut_cache import (
+    RE_ANY_DUT,
+    RE_MAIN_FUEL,
+    RE_MAIN_FUEL_PREFIX,
+    RE_FUEL_ALTS,
+    EXACT_FUEL_TYPE,
+    FUEL_MIN_VALID_L,
+    FUEL_MAX_VALID_L,
+    format_liters,
+    normalize_fuel_value,
+    extract_params_from_item,
+    extract_param_hint_from_sensor,
+    extract_assigned_param_name,
+    cached_filtered_custom_sensors,
+    select_fuel_sensor,
+)
+from detector_dut_filter import (
+    SensorMeta,
+    explain_rejection as dut_filter_explain,
+    list_dut_candidates,
+    resolve_target_duts,
+    select_primary_dut,
+)
+import detector as fuel_detector
+# WLN экспорт отключён в новой архитектуре; импорты убраны
+from pipeline.config.defaults import load_from_env as load_pipeline_config
+from pipeline.events import Event
+from pipeline.config.unit_config import GeneralConfig, SensorConfig, UnitConfig
+from pipeline.config.unit_config_service import UnitConfigService, UnitConfigValidationError
+from pipeline.engine import SensorCalculator, build_day_summary
+from pipeline.services.storage_service import PipelineStorageService, get_pipeline_storage_service
+from pipeline.services.unit_index import get_unit_index
+from bot.wialon_client import (
+    AsyncWialonClient,
+    AsyncWialonClientBuilder,
+    AsyncWialonSessionPool,
+    HTTP_POOL_MAX,
+    HTTP_TIMEOUT_CONN,
+    HTTP_TIMEOUT_READ,
+    REPORT_TEMPLATES_TTL,
+    UNIT_FLAGS_ADMIN_FIELDS,
+    UNIT_FLAGS_BASE_PLUS_FIELDS,
+    UNIT_FLAGS_DEVICE_META,
+    UNIT_FLAGS_SENSORS,
+    UNIT_FLAGS_SNAPSHOT,
+    UNIT_FLAGS_STATS,
+    WialonClient,
+    WialonSessionPool,
+    HW_TYPES_CACHE_TTL,
+    ZONE_DATA_CACHE_TTL,
+    GEOCODE_CACHE_MAX,
+    GEOCODE_TTL_SEC_BUCKET,
+    DUT_BATCH_RETRY_INITIAL_DELAY,
+    DUT_BATCH_RETRY_MAX_DELAY,
+    UNIT_DEVICE_BATCH_SIZE,
+    UNIT_DEVICE_BATCH_RETRIES,
+    UNIT_DEVICE_BATCH_BACKOFF,
+    UNIT_DEVICE_BATCH_BACKOFF_MAX,
+    UNIT_DEVICE_WORKERS,
+    UNIT_DEVICE_TOKENS_LIMIT,
+    fetch_device_meta_with_batches,
+    apply_device_meta_fields,
+    collect_device_clients,
+)
+from bot.constants import *  # noqa: F401,F403
+from bot.logging_setup import setup_logging
+from bot.settings_store import SettingsStore
+from bot.token_store import TokenStore
+from bot.stores import ZoneFileStore
+from bot.features import card as card_features
+from bot.features import dut as dut_features
+from bot.features import dut_admin as dut_admin_features
+from bot.features import params as params_features
+from bot.features import reports as report_features
+from bot.features import search as search_features
+from bot.features import sensors as sensor_features
+WEB_BASE_URL = os.getenv("WEB_BASE_URL", "http://localhost:8000").strip()
+send_param_prompt = params_features.send_prompt
+update_param_prompt = params_features.update_prompt
+delete_param_result_message = params_features.delete_param_result_message
+clear_param_runtime = params_features.clear_param_runtime
+from telegram import (
+    Update,
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    KeyboardButton,
+    InputFile,
+    CallbackQuery,
+)
+from telegram.error import BadRequest, TimedOut
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ConversationHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
+try:
+    from dotenv import load_dotenv  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    load_dotenv = None
+
+if load_dotenv is not None:
+    load_dotenv()
+
+# reports: fallback clear_report_context (отчёты выключены, но нужно чистить контекст)
+try:
+    clear_report_context = report_features.clear_report_context  # type: ignore[attr-defined]
+except AttributeError:
+    def clear_report_context(context: ContextTypes.DEFAULT_TYPE, cancel_job: bool = False) -> None:
+        if cancel_job:
+            job = context.user_data.get("report_job")
+            if isinstance(job, dict):
+                event = job.get("cancel_event")
+                if hasattr(event, "set"):
+                    try:
+                        event.set()
+                    except Exception:
+                        pass
+        keys = [
+            "report_job",
+            "report_selected_template",
+            "report_period",
+            "report_format",
+            "report_matches",
+            "report_offset",
+            "report_candidates_text",
+            "report_templates",
+            "report_last_query",
+            "report_search_mask",
+            "report_unit_id",
+            "report_unit_meta",
+        ]
+        for key in keys:
+            context.user_data.pop(key, None)
+
+@functools.lru_cache(maxsize=1)
+def _pipeline_card_enabled() -> bool:
+    """Return True when stats cards should be rendered from pipeline storage."""
+    try:
+        return load_pipeline_config().source_kind.lower() != "wialon"
+    except Exception:
+        return False
+
+
+@functools.lru_cache(maxsize=1)
+def _pipeline_search_enabled() -> bool:
+    """Return True when unit search should be served from pipeline storage."""
+
+    return _pipeline_card_enabled()
+
+
+def _ensure_settings_defaults(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    settings = context.user_data.setdefault("settings", {})
+    if chat_id is not None and not context.user_data.get("_settings_loaded"):
+        loaded = _load_persisted_settings(chat_id)
+        if loaded:
+            settings.update(loaded)
+        context.user_data["_settings_loaded"] = True
+        context.user_data["_settings_chat_id"] = chat_id
+    if "nearby_radius_m" not in settings:
+        settings["nearby_radius_m"] = DEFAULT_NEARBY_RADIUS_M
+    return settings
+
+
+def _get_nearby_radius(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: Optional[int] = None,
+) -> int:
+    settings = _ensure_settings_defaults(context, chat_id=chat_id)
+    try:
+        value = int(settings.get("nearby_radius_m", DEFAULT_NEARBY_RADIUS_M))
+    except (TypeError, ValueError):
+        value = DEFAULT_NEARBY_RADIUS_M
+    return max(NEARBY_RADIUS_MIN_M, min(NEARBY_RADIUS_MAX_M, value))
+
+
+def _set_nearby_radius(
+    context: ContextTypes.DEFAULT_TYPE,
+    value: int,
+    *,
+    chat_id: Optional[int] = None,
+) -> int:
+    if chat_id is not None:
+        _ensure_settings_defaults(context, chat_id=chat_id)
+    value = max(NEARBY_RADIUS_MIN_M, min(NEARBY_RADIUS_MAX_M, int(value)))
+    settings = _ensure_settings_defaults(context)
+    settings["nearby_radius_m"] = value
+    if chat_id is None:
+        chat_id = context.user_data.get("_settings_chat_id")
+    if isinstance(chat_id, int):
+        _persist_settings_from_context(context)
+    return value
+
+
+
+
+# ---------------------------------------------------------------------------
+
+
+# =================== ЛОГИ ===================
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+UNIT_CONFIG_DIR = DATA_DIR / "unit_configs"
+UNIT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+SENSOR_EXPORTS_DIR = UNIT_CONFIG_DIR / "exports"
+
+loggers = setup_logging(LOG_DIR)
+log = loggers.app
+cancel_log = loggers.cancel
+nearby_log = loggers.nearby
+dut_cal_log = loggers.dut_cal
+message_cache_store_log = loggers.message_cache_store
+concurrency_log = loggers.concurrency
+message_load_log = loggers.message_load
+message_calc_log = loggers.message_calc
+token_rotation_log = loggers.token_rotation
+geo_log = loggers.geo
+async def _safe_answer_callback(query: Optional[CallbackQuery], *args: Any, **kwargs: Any) -> None:
+    if query is None:
+        return
+    try:
+        await query.answer(*args, **kwargs)
+    except BadRequest as exc:
+        message = str(exc).lower()
+        if "query is too old" in message or "query id is invalid" in message:
+            log.debug("callback answer skipped: %s", exc)
+            return
+        raise
+    except Exception as exc:
+        log.debug("callback answer failed: %s", exc)
+dut_log = loggers.dut
+detector_log = loggers.detector
+card_log = loggers.card
+snapshot_log = loggers.snapshot
+
+_settings_store = SettingsStore(DATA_DIR / "user_settings.json")
+
+
+def _load_persisted_settings(chat_id: int) -> Dict[str, Any]:
+    return _settings_store.load(chat_id)
+
+
+def _persist_user_settings(chat_id: int, settings: Dict[str, Any]) -> None:
+    _settings_store.save(chat_id, settings)
+
+
+def _persist_settings_from_context(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = context.user_data.get("_settings_chat_id")
+    if not isinstance(chat_id, int):
+        return
+    settings = context.user_data.get("settings")
+    if not isinstance(settings, dict):
+        return
+    try:
+        _persist_user_settings(chat_id, settings)
+    except Exception as exc:
+        log.debug("persist_user_settings failed: %s", exc)
+
+
+# =================== ENV ===================
+def _env_str(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value
+
+
+TELEGRAM_BOT_TOKEN = _env_str("TELEGRAM_BOT_TOKEN", "").strip()
+LOGIN_HOST = _env_str("LOGIN_HOST", "").strip()
+if not LOGIN_HOST:
+    raise RuntimeError(
+        "LOGIN_HOST не задан в .env — укажите базовый хост платформы (например https://hosting.wialon-online.ru)"
+    )
+WIALON_LOGIN_HOST = LOGIN_HOST
+_WIALON_HOST_RAW = _env_str("WIALON_HOST", "").strip()
+WIALON_HOST = _WIALON_HOST_RAW or WIALON_LOGIN_HOST
+PUBLIC_CALLBACK_URL = _env_str("PUBLIC_CALLBACK_URL", "").strip()
+HMAC_SECRET = _env_str("HMAC_SECRET", "").strip()
+DEBUG_REPORT_ERRORS_TO_CHAT = _env_str("DEBUG_REPORT_ERRORS_TO_CHAT", "0").strip() not in {"", "0", "false", "False"}
+
+log.info("Telematics hosts configured: api=%s login=%s", WIALON_HOST, WIALON_LOGIN_HOST)
+
+EXECUTOR_WORKERS = int(_env_str("EXECUTOR_WORKERS", "8") or 8)
+
+# Включение индексов/миграции для админки
+ADMIN_RUN_MIGRATIONS = True
+
+EXECUTOR = ThreadPoolExecutor(max_workers=EXECUTOR_WORKERS)
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return float(default)
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return float(default)
+
+
+def _env_token_list(name: str) -> List[str]:
+    raw = _env_str(name, "")
+    if not raw:
+        return []
+    parts = re.split(r"[\s,;]+", raw.replace("\n", " ").replace("\r", " "))
+    tokens: List[str] = []
+    for part in parts:
+        token = part.strip()
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def _env_status_set(name: str, default: str) -> Set[int]:
+    raw = _env_str(name, default)
+    values: Set[int] = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError:
+            continue
+        if value > 0:
+            values.add(value)
+    return values
+
+
+NEARBY_LIMIT = max(1, _env_int("NEARBY_LIMIT", 5))
+NEARBY_MAX_KM = _env_float("NEARBY_MAX_KM", 0.0)
+DEFAULT_NEARBY_RADIUS_M = max(1, _env_int("NEARBY_RADIUS_M", 100))
+NEARBY_RADIUS_STEP_M = max(1, _env_int("NEARBY_RADIUS_STEP_M", 50))
+NEARBY_RADIUS_MIN_M = max(1, _env_int("NEARBY_RADIUS_MIN_M", 50))
+NEARBY_RADIUS_MAX_M = max(NEARBY_RADIUS_MIN_M, _env_int("NEARBY_RADIUS_MAX_M", 5000))
+WIALON_EXTRA_TOKENS = _env_token_list("WIALON_EXTRA_TOKENS")
+WIALON_TOKEN_ROTATE_AFTER_UNITS = max(1, _env_int("WIALON_TOKEN_ROTATE_AFTER_UNITS", 280))
+WIALON_TOKEN_COOLDOWN_SECONDS = max(0.0, _env_float("WIALON_TOKEN_COOLDOWN_SECONDS", 180.0))
+WIALON_TOKEN_ERROR_COOLDOWN_SECONDS = max(0.0, _env_float("WIALON_TOKEN_ERROR_COOLDOWN_SECONDS", 600.0))
+WIALON_TOKEN_ROTATE_HTTP_STATUSES = _env_status_set("WIALON_TOKEN_ROTATE_HTTP_STATUSES", "429,502,503,504")
+WIALON_BATCH_SLOW_THRESHOLD = max(0.0, _env_float("WIALON_BATCH_SLOW_THRESHOLD", 0.75))
+WIALON_BATCH_FAST_THRESHOLD = max(0.0, _env_float("WIALON_BATCH_FAST_THRESHOLD", 0.40))
+WIALON_BATCH_MIN_SIZE = max(10, _env_int("WIALON_BATCH_MIN_SIZE", 80))
+WIALON_BATCH_INITIAL_LIMIT = max(WIALON_BATCH_MIN_SIZE, _env_int("WIALON_BATCH_INITIAL_LIMIT", 160))
+WIALON_BATCH_WARMUP_LIMIT = max(WIALON_BATCH_MIN_SIZE, _env_int("WIALON_BATCH_WARMUP_LIMIT", 140))
+WIALON_BATCH_WARMUP_BATCHES = max(1, _env_int("WIALON_BATCH_WARMUP_BATCHES", 1))
+WIALON_PARALLEL_TOKEN_LIMIT = max(1, _env_int("WIALON_PARALLEL_TOKEN_LIMIT", 12))
+WIALON_PARALLEL_TOKEN_WARMUP = max(1, min(WIALON_PARALLEL_TOKEN_LIMIT, _env_int("WIALON_PARALLEL_TOKEN_WARMUP", 8)))
+WIALON_PARALLEL_TOKEN_RAMP_BATCHES = max(1, _env_int("WIALON_PARALLEL_TOKEN_RAMP_BATCHES", 2))
+WIALON_TOKEN_SOFT_COOLDOWN_SECONDS = max(0.0, _env_float("WIALON_TOKEN_SOFT_COOLDOWN_SECONDS", 60.0))
+WIALON_TOKEN_SOFT_COOLDOWN_AVG_THRESHOLD = max(
+    0.0, _env_float("WIALON_TOKEN_SOFT_COOLDOWN_AVG_THRESHOLD", 0.6)
+)
+WIALON_TOKEN_SOFT_COOLDOWN_DURATION = max(
+    0.0, _env_float("WIALON_TOKEN_SOFT_COOLDOWN_DURATION", 90.0)
+)
+WIALON_TOKEN_HARD_COOLDOWN_SECONDS = max(0.0, _env_float("WIALON_TOKEN_HARD_COOLDOWN_SECONDS", 120.0))
+WIALON_TOKEN_HARD_COOLDOWN_AVG_THRESHOLD = max(0.0, _env_float("WIALON_TOKEN_HARD_COOLDOWN_AVG_THRESHOLD", 2.0))
+WIALON_TOKEN_HARD_COOLDOWN_DURATION = max(0.0, _env_float("WIALON_TOKEN_HARD_COOLDOWN_DURATION", 240.0))
+WIALON_TOKEN_HARD_COOLDOWN_STREAK = max(1, _env_int("WIALON_TOKEN_HARD_COOLDOWN_STREAK", 2))
+WIALON_TOKEN_AVG_WINDOW = max(1, _env_int("WIALON_TOKEN_AVG_WINDOW", 4))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    return raw.lower() not in {"0", "false", "no", "off"}
+
+
+def _parse_admin_ids(raw: str) -> set[int]:
+    result: set[int] = set()
+    for part in (raw or "").replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            result.add(int(part))
+        except ValueError:
+            log.warning("ADMIN_CHAT_IDS содержит некорректное значение: %s", part)
+    return result
+
+
+ADMIN_WHITELIST = _parse_admin_ids(_env_str("ADMIN_CHAT_IDS", ""))
+
+
+GEO_CACHE_PATH_RAW = "data/geozones.v1.json.gz"
+GEO_CACHE_PATH = (BASE_DIR / GEO_CACHE_PATH_RAW).resolve()
+GEO_CACHE_TTL = 43200
+GEO_CACHE_REFRESH_INTERVAL = 3600
+GEO_CACHE_QUIET_HOURS_RAW = ""
+GEO_CACHE_JITTER = 0.0
+GEO_CACHE_CHUNK_RES_DEFAULT = 20
+GEO_CACHE_SLEEP_BETWEEN_CHUNKS_MS_DEFAULT = 200
+GEO_INCLUDE_CENTER_DEFAULT = False
+GEO_FILE_UPDATER_ENABLED = True
+GEO_MAX_NAMES = 5
+
+UNIT_SNAPSHOT_UPDATER_ENABLED = False  # full rebuild по расписанию отключён (bootstrap из телеметрии)
+UNIT_SNAPSHOT_REFRESH_ENABLED = False
+UNIT_SNAPSHOT_META_PATH = (BASE_DIR / "data/unit_snapshot.meta.json").resolve()
+# Параметры фонового обновления снапшота: по умолчанию раз в час, настраиваются через ENV.
+UNIT_SNAPSHOT_TTL = int(os.getenv("UNIT_SNAPSHOT_TTL_SEC", "3600") or 3600)
+UNIT_SNAPSHOT_REFRESH_INTERVAL = int(os.getenv("UNIT_SNAPSHOT_REFRESH_INTERVAL_SEC", "3600") or 3600)
+UNIT_SNAPSHOT_JITTER = float(os.getenv("UNIT_SNAPSHOT_JITTER", "0.15") or 0.15)
+UNIT_SNAPSHOT_PAGE_SIZE = 256
+UNIT_SNAPSHOT_SLEEP_BETWEEN_PAGES_MS = 50
+UNIT_DEVICE_DETAILS_TIMEOUT_SEC = float(os.getenv("UNIT_DEVICE_DETAILS_TIMEOUT_SEC", "20.0") or 20.0)
+UNIT_DEVICE_DETAILS_MAX_RETRIES = int(os.getenv("UNIT_DEVICE_DETAILS_MAX_RETRIES", "3") or 3)
+UNIT_DEVICE_BATCH_SIZE = int(os.getenv("UNIT_DEVICE_BATCH_SIZE", "16") or 16)
+UNIT_DEVICE_BATCH_RETRIES = int(os.getenv("UNIT_DEVICE_BATCH_RETRIES", "5") or 5)
+UNIT_DEVICE_BATCH_BACKOFF = float(os.getenv("UNIT_DEVICE_BATCH_BACKOFF", "2.0") or 2.0)
+UNIT_DEVICE_BATCH_BACKOFF_MAX = float(os.getenv("UNIT_DEVICE_BATCH_BACKOFF_MAX", "30.0") or 30.0)
+UNIT_DEVICE_WORKERS = int(os.getenv("UNIT_DEVICE_WORKERS", "4") or 4)
+UNIT_DEVICE_TOKENS_LIMIT = int(os.getenv("UNIT_DEVICE_TOKENS_LIMIT", "6") or 6)
+DUT_USE_BATCH = True
+DUT_BATCH_SIZE = 50
+DUT_PARALLELISM_ENABLED = False
+DUT_PARALLELISM_LIMIT = 4
+DUT_REPORT_CACHE_ONLY = True
+DUT_BATCH_RETRY_INITIAL_DELAY = 0.5
+DUT_BATCH_RETRY_MAX_DELAY = 8.0
+
+ZONE_STORE = ZoneFileStore(GEO_CACHE_PATH)
+
+
+def _parse_quiet_hours(raw: str) -> Optional[Tuple[int, int]]:
+    if not raw:
+        return None
+    try:
+        start_raw, end_raw = raw.split("-")
+        h1, m1 = map(int, start_raw.split(":"))
+        h2, m2 = map(int, end_raw.split(":"))
+    except Exception:
+        return None
+    start = max(0, min(23, h1)) * 60 + max(0, min(59, m1))
+    end = max(0, min(23, h2)) * 60 + max(0, min(59, m2))
+    return start, end
+
+
+def _in_quiet_hours(qh: Optional[Tuple[int, int]]) -> bool:
+    if not qh:
+        return True
+    now_local = datetime.now()
+    current = now_local.hour * 60 + now_local.minute
+    start, end = qh
+    if start <= end:
+        return start <= current < end
+    return current >= start or current < end
+
+
+def refresh_file_cache_forever(
+    client_factory: Callable[[], "WialonClient"], interval: int, ttl: int
+) -> None:
+    interval = max(60, int(interval) if interval else 60)
+    ttl = max(0, int(ttl) if ttl else 0)
+    qh = _parse_quiet_hours(GEO_CACHE_QUIET_HOURS_RAW)
+    jitter = max(0.0, min(0.5, float(GEO_CACHE_JITTER)))
+    chunk_res = max(1, GEO_CACHE_CHUNK_RES_DEFAULT)
+    sleep_ms = max(0, GEO_CACHE_SLEEP_BETWEEN_CHUNKS_MS_DEFAULT)
+    include_center = bool(GEO_INCLUDE_CENTER_DEFAULT)
+
+    while True:
+        if jitter > 0:
+            time.sleep(random.uniform(0, jitter) * max(5.0, float(interval)))
+
+        try:
+            fresh_payload = ZONE_STORE.load_if_present()
+            age = time.time() - (ZONE_STORE.mtime or 0)
+            if fresh_payload and age < ttl:
+                geo_log.debug(
+                    "file_cache: fresh (age=%.0fs < ttl=%ss), skip rebuild",
+                    age,
+                    ttl,
+                )
+                time.sleep(interval)
+                continue
+
+            if not _in_quiet_hours(qh):
+                geo_log.info("file_cache: outside quiet hours, skip this cycle")
+                time.sleep(interval)
+                continue
+
+            geo_log.info("file_cache: rebuild start include_center=%s", include_center)
+            cli = client_factory()
+            resource_ids = cli.list_resource_ids()
+            flags = 16 | (4 if include_center else 0)
+
+            if not getattr(cli, "_zone_all_strategy", None) and resource_ids:
+                try:
+                    cli._zone_all_strategy = cli._detect_zone_all_strategy(resource_ids[0], flags)
+                except Exception as exc:
+                    geo_log.warning("file_cache: detect strategy failed err=%r", exc)
+                    cli._zone_all_strategy = "omit"
+
+            strategy_label = cli._zone_all_strategy or cli.GEO_ZONE_ALL_STRATEGY or "omit"
+            geo_log.info("file_cache: using strategy=%s", strategy_label)
+
+            zone_ids_by_resource: Dict[int, List[int]] = {}
+            zone_meta: Dict[str, Dict[str, Any]] = {}
+            for idx in range(0, len(resource_ids), chunk_res):
+                part = resource_ids[idx : idx + chunk_res]
+                started = time.perf_counter()
+                for rid in part:
+                    params = cli._zone_all_params(rid, None, flags)
+                    try:
+                        resp = cli.request("resource/get_zone_data", params)
+                    except Exception as exc:
+                        geo_log.debug(
+                            "file_cache: resource %s load failed: %s",
+                            rid,
+                            exc,
+                        )
+                        continue
+                    parsed = cli._parse_zone_data_response(resp)
+                    zone_ids_by_resource[rid] = sorted(parsed.keys())
+                    for zid, payload in parsed.items():
+                        meta_key = f"{rid}:{zid}"
+                        name_val = None
+                        if isinstance(payload, dict):
+                            name_val = payload.get("n") or payload.get("name") or payload.get("nm")
+                        if not isinstance(name_val, str):
+                            name_val = f"ID {zid}"
+                        if include_center:
+                            center = None
+                            if isinstance(payload, dict):
+                                center = payload.get("ct") or payload.get("c") or payload.get("center")
+                            zone_meta[meta_key] = {"n": name_val, "ct": center}
+                        else:
+                            zone_meta[meta_key] = {"n": name_val, "ct": None}
+                geo_log.info(
+                    "file_cache: chunk %s..%s done in %.2fs (res=%s)",
+                    idx,
+                    idx + len(part) - 1,
+                    time.perf_counter() - started,
+                    len(part),
+                )
+                if sleep_ms:
+                    time.sleep(sleep_ms / 1000.0)
+
+            payload = {
+                "version": 1,
+                "dump_ts": int(time.time()),
+                "strategy": strategy_label,
+                "flags_used": flags,
+                "zone_ids_by_resource": {rid: ids for rid, ids in zone_ids_by_resource.items()},
+                "zone_meta": zone_meta,
+            }
+            ZONE_STORE.save_atomic(payload)
+            total_zones = sum(len(v) for v in zone_ids_by_resource.values())
+            geo_log.info(
+                "file_cache: rebuild done zones=%s resources=%s",
+                total_zones,
+                len(zone_ids_by_resource),
+            )
+        except Exception as exc:
+            geo_log.error("file_cache: rebuild failed: %r", exc)
+
+        time.sleep(interval)
+
+
+def _ensure_unit_item_normalized(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+
+    normalized = copy.deepcopy(raw)
+    name = normalized.get("nm")
+    if isinstance(name, str):
+        normalized["nm"] = name.strip()
+    try:
+        normalized["id"] = int(normalized.get("id"))
+    except Exception:
+        pass
+
+    sensors = dut_admin_features.normalize_unit_sensors(normalized.get("sens"))
+    if sensors:
+        normalized["sens"] = sensors
+    else:
+        normalized.pop("sens", None)
+
+    for key in ("pos", "lmsg"):
+        value = normalized.get(key)
+        if not isinstance(value, dict):
+            normalized.pop(key, None)
+
+    return normalized
+
+
+def _fetch_device_meta_with_batches(
+    base_client: "WialonClient",
+    unit_ids: Sequence[int],
+) -> Dict[int, Dict[str, Any]]:
+    if not unit_ids:
+        return {}
+    clients, extra_clients = collect_device_clients(base_client)
+    if not clients:
+        snapshot_log.warning("unit_snapshot: no tokens available for device details")
+        return {}
+    workers = max(1, min(len(clients), UNIT_DEVICE_WORKERS))
+    try:
+        return fetch_device_meta_with_batches(
+            base_client,
+            clients,
+            unit_ids,
+            chunk_size=UNIT_DEVICE_BATCH_SIZE,
+            retries=UNIT_DEVICE_BATCH_RETRIES,
+            backoff=UNIT_DEVICE_BATCH_BACKOFF,
+            max_backoff=UNIT_DEVICE_BATCH_BACKOFF_MAX,
+            workers=workers,
+        )
+    finally:
+        for extra in extra_clients:
+            with contextlib.suppress(Exception):
+                extra.close()
+
+
+def _build_unit_snapshot_payload(
+    client: "WialonClient", *, page_size: int, sleep_between_pages_ms: int
+) -> Tuple[Dict[int, Dict[str, Any]], int]:
+    spec = {
+        "itemsType": "avl_unit",
+        "propName": "sys_name",
+        "propValueMask": "*",
+        "sortType": "sys_name",
+    }
+    items_by_id: Dict[int, Dict[str, Any]] = {}
+    offset = 0
+    total_loaded = 0
+    sleep_between = max(0, int(sleep_between_pages_ms))
+
+    while True:
+        params = {
+            "spec": spec,
+            "force": 1,
+            "flags": UNIT_FLAGS_SNAPSHOT,
+            "from": offset,
+            "to": offset + page_size - 1,
+        }
+        started = time.perf_counter()
+        try:
+            snapshot_log.debug(
+                "unit_snapshot: core/search_items request offset=%s size=%s", offset, page_size
+            )
+            data = client.request("core/search_items", params)
+        except Exception as exc:
+            snapshot_log.error(
+                "unit_snapshot: core/search_items failed offset=%s size=%s err=%s",
+                offset,
+                page_size,
+                exc,
+            )
+            raise
+        duration = time.perf_counter() - started
+        raw_items = data.get("items", []) if isinstance(data, dict) else []
+        snapshot_log.debug(
+            "unit_snapshot: page from=%s count=%s duration=%.3fs",
+            offset,
+            len(raw_items),
+            duration,
+        )
+        if not raw_items:
+            break
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                uid = int(raw.get("id"))
+            except Exception:
+                continue
+            name = str(raw.get("nm") or f"id {uid}")
+            minimal_entry: Dict[str, Any] = {"id": uid, "nm": name}
+            inline_meta = client._extract_device_details(raw)
+            if inline_meta:
+                apply_device_meta_fields(minimal_entry, inline_meta)
+            device_block = minimal_entry.get("device")
+            payload: Dict[str, Any] = {"nm": name}
+            if isinstance(device_block, dict) and device_block:
+                compact_device = {}
+                if device_block.get("uid"):
+                    compact_device["uid"] = device_block["uid"]
+                if device_block.get("hardware"):
+                    compact_device["hardware"] = device_block["hardware"]
+                if compact_device:
+                    payload["device"] = compact_device
+            if minimal_entry.get("uid"):
+                payload["uid"] = minimal_entry["uid"]
+            if minimal_entry.get("hardware"):
+                payload["hardware"] = minimal_entry["hardware"]
+            items_by_id[uid] = payload
+        total_loaded += len(raw_items)
+        if len(raw_items) < page_size:
+            break
+        offset += page_size
+        if sleep_between:
+            time.sleep(sleep_between / 1000.0)
+
+    return items_by_id, total_loaded
+
+
+def _write_unit_snapshot_meta(meta: Dict[str, Any]) -> None:
+    try:
+        UNIT_SNAPSHOT_META_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(UNIT_SNAPSHOT_META_PATH, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, ensure_ascii=False)
+    except Exception as exc:
+        log.debug("unit_snapshot: failed to write meta: %s", exc)
+
+
+def _load_unit_snapshot_meta() -> Dict[str, Any]:
+    try:
+        with open(UNIT_SNAPSHOT_META_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        log.debug("unit_snapshot: failed to read meta: %s", exc)
+        return {}
+    return dict(data) if isinstance(data, dict) else {}
+
+
+def _search_units_locally(query: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """Поиск по локальному снапшоту/индексу.
+
+    Возвращает список словарей с ключами id/nm/pos/lmsg в том виде,
+    который ожидают downstream-хелперы поиска/карточки.
+    """
+    query_norm = (query or "").strip()
+    if not query_norm:
+        return []
+    try:
+        index = get_unit_index()
+        matches = index.search(query_norm, limit=limit) or []
+    except Exception:
+        matches = []
+
+    results: List[Dict[str, Any]] = []
+    for m in matches[:limit]:
+        # index entries already имеют id/nm; копируем, чтобы не мутировать кэш
+        entry = dict(m)
+        uid = entry.get("id")
+        if uid is not None:
+            try:
+                entry["id"] = int(uid)
+            except Exception:
+                pass
+        results.append(entry)
+    return results
+
+
+def _persist_unit_snapshot(items_by_id: Dict[int, Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    """Snapshot persistence removed in SQL-first architecture.
+
+    Left as a no-op wrapper returning a deep copy for backward compatibility
+    of calling code that still expects a dict.
+    """
+    return {uid: copy.deepcopy(item) for uid, item in items_by_id.items()}
+
+
+def _rebuild_unit_snapshot(
+    client: "WialonClient",
+) -> Tuple[Dict[int, Dict[str, Any]], int, float]:
+    """Legacy snapshot rebuild is now a no-op wrapper around payload builder."""
+    page_size = max(1, int(UNIT_SNAPSHOT_PAGE_SIZE))
+    sleep_between = UNIT_SNAPSHOT_SLEEP_BETWEEN_PAGES_MS
+    started = time.perf_counter()
+    snapshot_log.info(
+        "unit_snapshot: (legacy) rebuild start host=%s page_size=%s sleep_ms=%s",
+        getattr(client, "host", "?"),
+        page_size,
+        sleep_between,
+    )
+    items_by_id, total_loaded = _build_unit_snapshot_payload(
+        client,
+        page_size=page_size,
+        sleep_between_pages_ms=sleep_between,
+    )
+    snapshot = _persist_unit_snapshot(items_by_id)
+    duration = time.perf_counter() - started
+    snapshot_log.info(
+        "unit_snapshot: (legacy) rebuild done units=%s total_loaded=%s duration=%.2fs",
+        len(snapshot),
+        total_loaded,
+        duration,
+    )
+    return snapshot, total_loaded, duration
+
+
+def _load_snapshot_from_service() -> Tuple[Dict[int, Dict[str, Any]], Optional[int]]:
+    """Snapshot service removed: always return empty snapshot."""
+    return {}, None
+
+
+def _lookup_unit_snapshot(unit_id: int) -> Optional[Dict[str, Any]]:
+    return None
+
+
+def _bootstrap_unit_snapshot_from_cache() -> None:
+    log.info("unit_snapshot: bootstrap skipped (SQL-first architecture)")
+
+
+token_store = TokenStore(DATA_DIR / "auth_tokens.sqlite3")
+
+# Кэш клиентов Wialon (по chat_id) и глобальный кэш зон
+_WIALON_CLIENT_CACHE_LOCK = threading.Lock()
+_WIALON_CLIENT_CACHE: Dict[int, "WialonClient"] = {}
+
+_ZONE_CACHE_LOCK = threading.Lock()
+_ZONE_CACHE_TS: float = 0.0
+_ZONE_CACHE_DATA: Dict[int, Dict[int, Dict[str, Any]]] = {}
+
+_GEO_FILE_UPDATER_LOCK = threading.Lock()
+_GEO_FILE_UPDATER_STARTED = False
+
+_UNIT_SNAPSHOT_UPDATER_LOCK = threading.Lock()
+_UNIT_SNAPSHOT_UPDATER_STARTED = False
+_UNIT_SNAPSHOT_DAEMON_LOCK = threading.Lock()
+_UNIT_SNAPSHOT_DAEMON_STARTED = False
+
+
+@functools.lru_cache(maxsize=1)
+def get_unit_config_service() -> UnitConfigService:
+    dsn = os.getenv("DEVICE_REGISTRY_DSN") or os.getenv("DATABASE_URL")
+    if not dsn:
+        raise RuntimeError("DEVICE_REGISTRY_DSN or DATABASE_URL env var is required for UnitConfigService in bot")
+    return UnitConfigService(dsn, schema_path=None)
+
+
+@functools.lru_cache(maxsize=512)
+def _load_unit_config(unit_id: int) -> Optional[UnitConfig]:
+    service = get_unit_config_service()
+    try:
+        return service.load(unit_id)
+    except FileNotFoundError:
+        return None
+    except UnitConfigValidationError as exc:
+        log.warning("unit_config: validation failed unit=%s err=%s", unit_id, exc)
+        return None
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("unit_config: failed to load unit=%s err=%s", unit_id, exc)
+        return None
+
+
+def _ensure_unit_config_object(unit_id: int) -> UnitConfig:
+    config = _load_unit_config(unit_id)
+    if config:
+        return config
+    general = GeneralConfig(name=f"id {unit_id}")
+    return UnitConfig(unit_id=unit_id, source_kind="local", general=general)
+
+
+def _clear_unit_config_cache() -> None:
+    try:
+        _load_unit_config.cache_clear()  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+
+
+def ensure_geo_file_updater(client: "WialonClient") -> None:
+    if not GEO_FILE_UPDATER_ENABLED:
+        return
+    global _GEO_FILE_UPDATER_STARTED
+    with _GEO_FILE_UPDATER_LOCK:
+        if _GEO_FILE_UPDATER_STARTED:
+            return
+        if not client.token:
+            geo_log.info("file_cache: cannot start updater without token")
+            return
+
+        host = client.host
+        token = client.token
+
+        def factory() -> "WialonClient":
+            return WialonClient(host, token)
+
+        thread = threading.Thread(
+            target=refresh_file_cache_forever,
+            args=(factory, GEO_CACHE_REFRESH_INTERVAL, GEO_CACHE_TTL),
+            name="geo-file-cache",
+            daemon=True,
+        )
+        thread.start()
+        _GEO_FILE_UPDATER_STARTED = True
+        geo_log.info(
+            "file_cache: updater started interval=%ss ttl=%ss quiet=%s jitter=%.2f path=%s",
+            GEO_CACHE_REFRESH_INTERVAL,
+            GEO_CACHE_TTL,
+            GEO_CACHE_QUIET_HOURS_RAW or "any",
+            GEO_CACHE_JITTER,
+            str(GEO_CACHE_PATH),
+        )
+
+
+def ensure_unit_snapshot_updater(client: "WialonClient") -> None:
+    if not UNIT_SNAPSHOT_UPDATER_ENABLED:
+        return
+    global _UNIT_SNAPSHOT_UPDATER_STARTED
+    with _UNIT_SNAPSHOT_UPDATER_LOCK:
+        if _UNIT_SNAPSHOT_UPDATER_STARTED:
+            return
+        if not client.token:
+            log.info("unit_snapshot: cannot start updater without token")
+            return
+
+        host = client.host
+        token = client.token
+
+        def factory() -> "WialonClient":
+            return WialonClient(host, token)
+
+        thread = threading.Thread(
+            target=refresh_unit_snapshot_forever,
+            args=(factory, UNIT_SNAPSHOT_REFRESH_INTERVAL, UNIT_SNAPSHOT_TTL),
+            name="unit-snapshot-cache",
+            daemon=True,
+        )
+        thread.start()
+        _UNIT_SNAPSHOT_UPDATER_STARTED = True
+        log.info(
+            "unit_snapshot: updater started interval=%ss ttl=%ss page_size=%s",
+            UNIT_SNAPSHOT_REFRESH_INTERVAL,
+            UNIT_SNAPSHOT_TTL,
+            UNIT_SNAPSHOT_PAGE_SIZE,
+        )
+
+
+def _start_unit_snapshot_daemon() -> None:
+    if not UNIT_SNAPSHOT_REFRESH_ENABLED:
+        return
+    global _UNIT_SNAPSHOT_DAEMON_STARTED
+    with _UNIT_SNAPSHOT_DAEMON_LOCK:
+        if _UNIT_SNAPSHOT_DAEMON_STARTED:
+            return
+        try:
+            pipeline_cfg = load_pipeline_config()
+        except Exception as exc:
+            snapshot_log.debug("unit_snapshot: failed to load pipeline config: %s", exc)
+            return
+        token = pipeline_cfg.wialon_token
+        if not token:
+            for extra in pipeline_cfg.wialon_extra_tokens:
+                if extra:
+                    token = extra
+                    break
+        if not token:
+            snapshot_log.info("unit_snapshot: skipped daemon start (no Wialon token)")
+            return
+        host = pipeline_cfg.wialon_host
+        client: Optional[WialonClient] = None
+        try:
+            client = WialonClient(host, token)
+            ensure_unit_snapshot_updater(client)
+            snapshot_log.info("unit_snapshot: background updater armed host=%s", host)
+        except Exception as exc:
+            snapshot_log.warning("unit_snapshot: failed to start updater: %s", exc)
+            return
+        finally:
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    client.close()
+        _UNIT_SNAPSHOT_DAEMON_STARTED = True
+
+
+def ensure_unit_snapshot_updater(client: "WialonClient") -> None:
+    if not UNIT_SNAPSHOT_UPDATER_ENABLED:
+        return
+    global _UNIT_SNAPSHOT_UPDATER_STARTED
+    with _UNIT_SNAPSHOT_UPDATER_LOCK:
+        if _UNIT_SNAPSHOT_UPDATER_STARTED:
+            return
+        if not client.token:
+            log.info("unit_file_cache: cannot start updater without token")
+            return
+
+        host = client.host
+        token = client.token
+
+        def factory() -> "WialonClient":
+            return WialonClient(host, token)
+
+        thread = threading.Thread(
+            target=refresh_unit_snapshot_forever,
+            args=(factory, UNIT_SNAPSHOT_REFRESH_INTERVAL, UNIT_SNAPSHOT_TTL),
+            name="unit-snapshot-cache",
+            daemon=True,
+        )
+        thread.start()
+        _UNIT_SNAPSHOT_UPDATER_STARTED = True
+        log.info(
+            "unit_snapshot: updater started interval=%ss ttl=%ss page_size=%s",
+            UNIT_SNAPSHOT_REFRESH_INTERVAL,
+            UNIT_SNAPSHOT_TTL,
+            UNIT_SNAPSHOT_PAGE_SIZE,
+        )
+
+
+def _set_active_ui(context: ContextTypes.DEFAULT_TYPE, ui: Optional[str]) -> None:
+    if not ui:
+        context.chat_data.pop(ACTIVE_UI_KEY, None)
+        return
+    context.chat_data[ACTIVE_UI_KEY] = ui
+
+
+def _active_ui(context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    return context.chat_data.get(ACTIVE_UI_KEY)
+
+
+async def _mute_admin_ui(context: ContextTypes.DEFAULT_TYPE) -> None:
+    panel = context.chat_data.get("admin_panel") or {}
+    anchor = panel.get("anchor")
+    if not anchor:
+        return
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=anchor["chat_id"],
+            message_id=anchor["message_id"],
+            reply_markup=None,
+        )
+    except Exception as exc:
+        log.debug("suppress_admin_keyboard failed: %s", exc)
+
+
+async def _activate_objects_ui(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _mute_admin_ui(context)
+    _set_active_ui(context, UI_OBJECTS)
+    card_log.debug("card:start_ui ui=objects chat=%s", context._chat_id if hasattr(context, "_chat_id") else None)
+
+
+
+async def _suppress_objects_keyboards(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await clear_stats_buttons(context)
+    _clear_stats_generation(context)
+    anchor = context.user_data.get("anchor")
+    if not anchor:
+        return
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=anchor["chat_id"],
+            message_id=anchor["message_id"],
+            reply_markup=None,
+        )
+    except Exception as exc:
+        log.debug("suppress_objects_keyboards failed: %s", exc)
+
+
+def _log_nearby(stage: str, *, chat_id=None, unit_id=None, **fields: Any) -> None:
+    payload = [f"stage={stage}"]
+    if chat_id is not None:
+        payload.append(f"chat={chat_id}")
+    if unit_id is not None:
+        payload.append(f"unit={unit_id}")
+    for k, v in fields.items():
+        payload.append(f"{k}={v}")
+    nearby_log.info(" | ".join(str(p) for p in payload))
+
+
+async def _present_search_results(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    units: List[Dict[str, Any]],
+    *,
+    search_token: int,
+    client: Optional["WialonClient"],
+    anchor_message_id: Optional[int],
+) -> int:
+    """Единая отрисовка результатов поиска (локальный или Wialon)."""
+    if search_token != search_features.current_search_generation(context):
+        return _objects_mode_to_state(context)
+
+    card_log.info(
+        "card:present_results units=%s token=%s ui=%s anchor=%s",
+        len(units or []),
+        search_token,
+        _active_ui(context),
+        _anchor_message_id(context),
+    )
+
+    if _active_ui(context) != UI_OBJECTS:
+        return _objects_mode_to_state(context)
+
+    if anchor_message_id is not None:
+        current_anchor_id = _anchor_message_id(context)
+        if current_anchor_id is None or current_anchor_id != anchor_message_id:
+            return _objects_mode_to_state(context)
+
+    if not units:
+        _reset_search_context(context)
+        await send_new_anchor_below(
+            update,
+            "Объект не найден. Попробуйте ввести другое имя",
+            kb_search_prompt(context),
+            context,
+        )
+        return STATE_FIND_QUERY
+
+    if len(units) == 1:
+        unit_id = int(units[0]["id"])
+        selected = {"id": unit_id, "nm": units[0]["nm"]}
+        context.user_data["chosen_unit"] = selected
+        search_features.set_units(context, units)
+        _set_objects_mode(context, OBJECTS_MODE_CARD_IDLE)
+        await delete_anchor(context)
+        client_to_use = client
+        if client_to_use is None:
+            client_to_use = await require_wialon_client(
+                update,
+                context,
+                "Чтобы показать карточку, авторизуйтесь в Wialon.",
+            )
+            if not client_to_use:
+                return STATE_AUTH_WAIT_TOKEN
+        return await show_stats_then_actions(
+            update,
+            context,
+            unit_id,
+            selected["nm"],
+            client_to_use,
+            preserve_previous=True,
+        )
+
+    search_features.set_units(context, units[: search_features.SEARCH_UNITS_LIMIT])
+    _set_objects_mode(context, OBJECTS_MODE_LIST)
+    await _render_units_page(
+        context,
+        chat_id=update.effective_chat.id if update.effective_chat else None,
+        update=update,
+        offset=0,
+        reanchor=True,
+    )
+    return STATE_WAIT_UNIT
+
+
+async def set_anchor_on(message: Message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сохраняет ссылку на сообщение-контейнер для дальнейших правок."""
+    context.user_data["anchor"] = {"chat_id": message.chat_id, "message_id": message.message_id}
+
+
+async def delete_anchor(context: ContextTypes.DEFAULT_TYPE) -> None:
+    anchor = context.user_data.get("anchor")
+    if not anchor:
+        return
+    try:
+        await context.bot.delete_message(chat_id=anchor["chat_id"], message_id=anchor["message_id"])
+    except Exception as exc:
+        log.debug("delete_anchor: %s", exc)
+    finally:
+        context.user_data.pop("anchor", None)
+
+
+async def edit_anchor(
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    markup: Optional[InlineKeyboardMarkup] = None,
+    parse_mode: Optional[str] = "Markdown",
+) -> None:
+    anchor = context.user_data.get("anchor")
+    if not anchor:
+        return
+    try:
+        await context.bot.edit_message_text(
+            chat_id=anchor["chat_id"],
+            message_id=anchor["message_id"],
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=markup,
+        )
+    except Exception as exc:
+        log.debug("edit_anchor failed: %s", exc)
+
+
+async def send_new_anchor_below(
+    update: Update,
+    text: str,
+    markup: Optional[InlineKeyboardMarkup],
+    context: ContextTypes.DEFAULT_TYPE,
+    parse_mode: Optional[str] = "Markdown",
+) -> None:
+    await delete_anchor(context)
+    msg = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=text,
+        reply_markup=markup,
+        parse_mode=parse_mode,
+    )
+    await set_anchor_on(msg, context)
+
+
+async def delete_stats_map_message(context: ContextTypes.DEFAULT_TYPE) -> None:
+    meta = context.user_data.pop("stats_map_msg", None)
+    if not meta:
+        return
+    try:
+        await context.bot.delete_message(chat_id=meta["chat_id"], message_id=meta["message_id"])
+    except Exception as exc:
+        log.debug("delete_stats_map_message: %s", exc)
+
+
+async def delete_stats_message(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await delete_stats_map_message(context)
+    smeta = context.user_data.pop("stats_msg", None)
+    if not smeta:
+        return
+    try:
+        await context.bot.delete_message(chat_id=smeta["chat_id"], message_id=smeta["message_id"])
+    except Exception as exc:
+        log.debug("delete_stats_message: %s", exc)
+
+
+def _fmt_ts_utc(ts: Optional[int]) -> str:
+    if not ts:
+        return "—"
+    dt_local = datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone()
+    return dt_local.strftime("%Y-%m-%d %H:%M")
+
+
+def _build_local_stats_item(unit_id: int) -> Dict[str, Any]:
+    """Собрать минимальный item для карточки из локального снапшота и latest_metrics."""
+    snapshot = _lookup_unit_snapshot(unit_id) or {}
+    storage = get_pipeline_storage_service()
+    latest = storage.get_latest_metrics(unit_id) or {}
+
+    pos: Dict[str, Any] = {}
+    lmsg: Dict[str, Any] = {}
+    lat = latest.get("lat")
+    lon = latest.get("lon")
+    if lat is not None:
+        pos["y"] = lat
+    if lon is not None:
+        pos["x"] = lon
+    if "sc" in latest:
+        pos["sc"] = latest.get("sc")
+    ts = latest.get("device_ts") or latest.get("received_ts")
+    if ts:
+        try:
+            ts_int = int(ts)
+        except Exception:
+            ts_int = None
+        if ts_int:
+            pos.setdefault("t", ts_int)
+            lmsg["t"] = ts_int
+
+    params = latest.get("params") or latest.get("prms") or {}
+
+    return {
+        "id": unit_id,
+        "nm": snapshot.get("nm") or f"id {unit_id}",
+        "uid": snapshot.get("uid"),
+        "hw": snapshot.get("hw") or snapshot.get("d"),
+        "pos": pos,
+        "lmsg": lmsg,
+        "prms": params,
+        "params": params,
+        "pipeline_event": latest,
+    }
+
+
+def _extract_address_from_pos(pos: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(pos, dict):
+        return None
+    for key in ("addr", "address", "ad", "n", "nm", "txt", "dsc"):
+        value = pos.get(key)
+        if isinstance(value, str):
+            value = value.strip()
+            if value:
+                return value
+    return None
+
+
+def _format_coords(lat: Optional[float], lon: Optional[float]) -> Optional[str]:
+    if lat is None or lon is None:
+        return None
+    try:
+        return f"{float(lat):.5f}, {float(lon):.5f}"
+    except Exception:
+        return None
+
+
+def _build_map_url(address: Optional[str] = None, lat: Optional[float] = None, lon: Optional[float] = None) -> Optional[str]:
+    if lat is not None and lon is not None:
+        try:
+            lat_f = float(lat)
+            lon_f = float(lon)
+            return f"https://maps.google.com/?q={lat_f:.6f},{lon_f:.6f}"
+        except Exception:
+            pass
+    if address:
+        query = quote_plus(address.strip())
+        if query:
+            return f"https://maps.google.com/?q={query}"
+    return None
+
+
+def _format_line_with_link(line: str, link_text: str, url: str) -> str:
+    safe_url = html.escape(url, quote=True)
+    safe_text = html.escape(link_text)
+    prefix, sep, _ = line.partition(":")
+    if sep:
+        prefix_html = html.escape(prefix + sep)
+        return f"{prefix_html} <a href=\"{safe_url}\">{safe_text}</a>"
+    return f"{html.escape(line)} <a href=\"{safe_url}\">{safe_text}</a>"
+
+
+def _format_lines_with_links(lines: List[str], links: Dict[int, Tuple[str, str]]) -> str:
+    formatted: List[str] = []
+    for idx, line in enumerate(lines):
+        link = links.get(idx)
+        if link and all(link):
+            formatted.append(_format_line_with_link(line, link[0], link[1]))
+        else:
+            formatted.append(html.escape(line))
+    return "\n".join(formatted)
+
+
+def _human_ago(from_ts: Optional[int]) -> Tuple[str, str]:
+    if not from_ts:
+        return "⚪", "неизвестно"
+    now = datetime.now(timezone.utc)
+    dt = datetime.fromtimestamp(int(from_ts), tz=timezone.utc)
+    delta = now - dt
+    mins = int(delta.total_seconds() // 60)
+    if mins < 30:
+        dot = "🟢"
+    elif mins < 24 * 60:
+        dot = "🟡"
+    else:
+        dot = "🔴"
+    if mins < 60:
+        txt = f"{mins} мин"
+    elif mins < 24 * 60:
+        hours = mins // 60
+        txt = f"{hours} ч"
+    else:
+        days = mins // (24 * 60)
+        txt = f"{days} дн"
+    return dot, txt
+
+
+def _fmt_km(d: Optional[float]) -> str:
+    if d is None:
+        return "—"
+    q = Decimal(str(d)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP).normalize()
+    s = format(q, "f").rstrip("0").rstrip(".")
+    return (s or "0") + " км"
+
+
+def _fmt_distance_m(distance_m: Optional[float]) -> str:
+    if distance_m is None:
+        return "-"
+    try:
+        value = float(distance_m)
+    except (TypeError, ValueError):
+        return "-"
+    if value < 1000:
+        return f"{int(round(value))} м"
+    return _fmt_km(value / 1000.0)
+
+
+def _is_online(last_ts: Optional[int]) -> bool:
+    """True, если последнее сообщение свежее ONLINE_THRESHOLD_SEC."""
+    if not last_ts:
+        return False
+    now = datetime.now(timezone.utc)
+    dt = datetime.fromtimestamp(int(last_ts), tz=timezone.utc)
+    return (now - dt) <= timedelta(seconds=ONLINE_THRESHOLD_SEC)
+
+
+def _build_dut_lines2(
+    client: "WialonClient",
+    unit_item: Dict[str, Any],
+    unit_id: int,
+    *,
+    precalc_main_value: Optional[float] = None,
+    allow_calc: bool = True,
+    rpc_stats: Optional[Dict[str, int]] = None,
+) -> List[str]:
+    sens_map = (unit_item or {}).get("sens") or {}
+    sensors = [v for v in sens_map.values() if isinstance(v, dict)]
+
+    main_sensor = select_fuel_sensor(unit_item)
+    main_value: Optional[float] = None
+    main_raw_value: Optional[float] = None
+    value_source = "none"
+    has_any_dut = False
+
+    if isinstance(main_sensor, dict):
+        main_name = (main_sensor.get("n") or "").strip()
+        if main_name and RE_ANY_DUT.match(main_name):
+            has_any_dut = True
+
+    def _safe_float(value: Any) -> Optional[float]:
+        return normalize_fuel_value(value)
+
+    def _is_plausible_fuel_value(val: Any) -> bool:
+        fv = _safe_float(val)
+        return fv is not None and (FUEL_MIN_VALID_L <= fv <= FUEL_MAX_VALID_L)
+
+    def _consider_main_value(source: str, value: Any) -> bool:
+        nonlocal main_value, main_raw_value, value_source
+        fv = _safe_float(value)
+        if fv is None:
+            return False
+        main_raw_value = fv
+        value_source = source
+        if _is_plausible_fuel_value(fv):
+            main_value = fv
+            return True
+        return False
+
+    precalc_used = False
+    if precalc_main_value is not None:
+        precalc_used = True
+        _consider_main_value("precalc", precalc_main_value)
+
+    if isinstance(main_sensor, dict) and main_value is None:
+        for key in ("last_value", "v", "value"):
+            if _consider_main_value("cache", main_sensor.get(key)):
+                break
+        sid_raw = main_sensor.get("id")
+        try:
+            sid = int(sid_raw)
+        except Exception:
+            sid = None
+        if (
+            main_value is None
+            and sid is not None
+            and not precalc_used
+            and allow_calc
+        ):
+            try:
+                if rpc_stats is not None:
+                    rpc_stats["calc_single"] = rpc_stats.get("calc_single", 0) + 1
+                calc_value = client.calc_sensor_value(unit_id, sid)
+            except Exception as exc:
+                log.debug("fuel: calc main sensor failed id=%s: %s", sid, exc)
+            else:
+                _consider_main_value("calc", calc_value)
+
+    def _log_and_return(lines: List[str], failures: List[Tuple[Any, str, Optional[float], Optional[str]]]) -> List[str]:
+        ms_id = main_sensor.get("id") if isinstance(main_sensor, dict) else None
+        ms_name = (main_sensor.get("n") or "").strip() if isinstance(main_sensor, dict) else None
+        ms_type = main_sensor.get("t") if isinstance(main_sensor, dict) else None
+        log.debug(
+            "fuel: main_sensor id=%s name=%r type=%r; value_source=%s; value=%s; failures=%s",
+            ms_id,
+            ms_name or None,
+            ms_type,
+            value_source,
+            main_raw_value,
+            failures,
+        )
+        return lines
+
+    main_lines: List[str] = []
+    if main_value is not None:
+        formatted = format_liters(main_value)
+        if formatted is not None:
+            suffix = "" if formatted.endswith("л") else " л"
+            main_lines.append(f"• ДУТ (уровень топлива): {formatted}{suffix}")
+
+    failures: List[Tuple[Any, str, Optional[float], Optional[str]]] = []
+    failure_lines: List[str] = []
+    for sensor in sensors:
+        name = (sensor.get("n") or "").strip()
+        if not name:
+            continue
+        if not RE_ANY_DUT.match(name):
+            continue
+        has_any_dut = True
+        try:
+            sid = int(sensor.get("id"))
+        except Exception:
+            sid = None
+        fv: Optional[float] = None
+        for key in ("last_value", "v", "value"):
+            if key in sensor:
+                candidate = _safe_float(sensor.get(key))
+                if candidate is not None:
+                    fv = candidate
+                    break
+        if fv is None:
+            continue
+        if fv < 1.0:
+            hint: Optional[str] = None
+            try:
+                hint = extract_param_hint_from_sensor(sensor)
+            except Exception:
+                hint = None
+            if not hint:
+                try:
+                    hint = extract_assigned_param_name(sensor)
+                except Exception:
+                    hint = None
+            suffix = f" по параметру {hint}" if hint else ""
+            failure_lines.append(f"• {name} — не работает{suffix}")
+            failures.append((sensor.get("id"), name, fv, hint))
+
+    if has_any_dut and main_value is None:
+        missing_line = "• нет последнего значения (кэш пуст)"
+        if missing_line not in failure_lines:
+            failure_lines.append(missing_line)
+            failures.append((None, "cache-miss", None, None))
+
+    if failure_lines:
+        combined: List[str] = []
+        if main_lines:
+            combined.extend(main_lines)
+        combined.extend(failure_lines)
+        return _log_and_return(combined if combined else failure_lines, failures)
+
+    if main_lines:
+        return _log_and_return(main_lines, failures)
+
+    if not has_any_dut:
+        return _log_and_return(["• ДУТ не установлен"], failures)
+
+    return _log_and_return([], failures)
+
+
+def _dut_problem_descriptions(lines: List[str]) -> List[str]:
+    issues: List[str] = []
+    seen: Set[str] = set()
+    for line in lines:
+        text = str(line or "").strip()
+        if not text:
+            continue
+        if text.startswith("•"):
+            text = text[1:].strip()
+        lowered = text.casefold()
+        if "не установлен" in lowered:
+            normalized = "ДУТ не установлен"
+            if normalized not in seen:
+                seen.add(normalized)
+                issues.append(normalized)
+            continue
+        if "не работает" in lowered:
+            if text not in seen:
+                seen.add(text)
+                issues.append(text)
+            continue
+        if "нет последнего значения" in lowered:
+            normalized = "нет последнего значения (кэш пуст)"
+            if normalized not in seen:
+                seen.add(normalized)
+                issues.append(normalized)
+    return issues
+
+
+async def show_stats_then_actions(
+    update_or_q,
+    context: ContextTypes.DEFAULT_TYPE,
+    unit_id: int,
+    unit_name: str,
+    client: Optional["WialonClient"],
+    via_callback: bool = False,
+    *,
+    preserve_previous: bool = False,
+) -> int:
+    card_log.info(
+        "card:stats_start unit_id=%s unit_name=%s via_callback=%s preserve_previous=%s client=%s",
+        unit_id,
+        unit_name,
+        via_callback,
+        preserve_previous,
+        type(client).__name__ if client else None,
+    )
+    stats_token = _set_stats_generation(context, unit_id)
+    prev_stats_meta = context.user_data.get("stats_msg") if preserve_previous else None
+    def _restore_previous_stats_meta() -> None:
+        if preserve_previous and prev_stats_meta and "stats_msg" not in context.user_data:
+            context.user_data["stats_msg"] = prev_stats_meta
+
+    if preserve_previous:
+        await clear_stats_buttons(context)
+        context.user_data.pop("stats_msg", None)
+    else:
+        await delete_stats_message(context)
+
+    # Источник данных: локальный pipeline, без Wialon (используем Wialon только если pipeline отключён)
+    use_local = _pipeline_card_enabled()
+    if use_local:
+        try:
+            item = _build_local_stats_item(unit_id)
+        except Exception as exc:
+            _restore_previous_stats_meta()
+            log.exception("Ошибка загрузки локального item (Stats)")
+            card_log.error("card:stats_error unit_id=%s err=%s", unit_id, exc)
+            target = update_or_q.message
+            await target.reply_text(
+                "Не удалось загрузить объект из локального кэша. Обновите снапшот/поток и попробуйте снова.",
+                reply_markup=kb_cancel("back:find"),
+            )
+            return STATE_FIND_QUERY
+    else:
+        try:
+            item = await run_blocking(client.get_unit_full_for_stats, unit_id)  # type: ignore[arg-type]
+        except Exception as exc:
+            _restore_previous_stats_meta()
+            log.exception("Ошибка загрузки юнита (Stats)")
+            card_log.error("card:stats_error unit_id=%s err=%s", unit_id, exc)
+            target = update_or_q.message
+            await target.reply_text(
+                f"Не удалось загрузить объект: `{exc}`",
+                reply_markup=kb_cancel("back:find"),
+            )
+            return STATE_FIND_QUERY
+
+    current_token, current_unit = _current_stats_generation(context)
+    if stats_token != current_token or current_unit != unit_id:
+        _restore_previous_stats_meta()
+        return STATE_WAIT_UNIT
+
+    if _active_ui(context) != UI_OBJECTS:
+        _restore_previous_stats_meta()
+        return STATE_WAIT_UNIT
+
+    params_map, params_order = extract_params_from_item(item)
+
+    # Если Wialon не вернул параметры, пробуем подтянуть последнее состояние из локального latest_metrics
+    if not params_map:
+        try:
+            latest = get_pipeline_storage_service().get_latest_metrics(unit_id)
+        except Exception as exc:
+            latest = None
+            log.debug("latest_metrics fetch failed: %s", exc)
+        if isinstance(latest, dict):
+            metrics_params = latest.get("params") or latest.get("prms") or {}
+            if isinstance(metrics_params, dict) and metrics_params:
+                params_map = dict(metrics_params)
+                params_order = list(metrics_params.keys())
+                card_log.info("card:params_filled_from_latest unit_id=%s keys=%s", unit_id, len(params_map))
+
+    unit_config: Optional[UnitConfig] = None
+    try:
+        unit_config = _ensure_unit_config_object(unit_id)
+    except Exception:
+        unit_config = None
+
+    context.user_data["params_map"] = params_map
+    context.user_data["params_order"] = params_order
+    clear_param_runtime(context)
+    await delete_param_result_message(context)
+
+    pos = item.get("pos") or {}
+    lmsg = item.get("lmsg") or {}
+    last_ts = lmsg.get("t") or pos.get("t")
+    sats = pos.get("sc")
+    online = _is_online(last_ts)
+    online_emoji = "🟢" if online else "🔴"
+    online_text = f"{online_emoji} На связи" if online else f"{online_emoji} Нет связи"
+
+    fuel_line = "—"
+    if not use_local and client:
+        sensor = WialonClient._pick_fuel_sensor(item)
+        if sensor:
+            sensor_id = int(sensor.get("id"))
+            try:
+                await run_blocking(client.load_last_message, unit_id)
+                value = await run_blocking(client.calc_sensor_value, unit_id, sensor_id)
+                normalized = normalize_fuel_value(value)
+                if normalized is not None and FUEL_MIN_VALID_L <= normalized <= FUEL_MAX_VALID_L:
+                    formatted = format_liters(normalized)
+                    if formatted is not None:
+                        fuel_line = f"{formatted} л"
+            except Exception as exc:
+                log.warning(f"Не удалось получить значение ДУТ: {exc}")
+    # Фоллбек: если нет Wialon-значения, попробуем вычислить из UnitConfig/params_map
+    sensor_values: Optional[Dict[str, Tuple[Optional[float], Optional[float]]]] = None
+    if unit_config:
+        try:
+            sensor_values = card_features.compute_unit_config_sensor_values(unit_config, params_map)
+            fuel_from_uc = card_features.pick_unit_config_fuel_display(unit_config, sensor_values)
+            if fuel_from_uc:
+                fuel_line = fuel_from_uc
+        except Exception as exc:
+            log.debug("unitconfig fuel calc failed: %s", exc)
+
+    sat_dot, sat_ago = _human_ago(pos.get("t"))
+    sats_text = f"{sats} спутн." if sats is not None else "—"
+    lat_raw = pos.get("y") if isinstance(pos, dict) else None
+    if lat_raw is None and isinstance(pos, dict):
+        lat_raw = pos.get("lat")
+    lon_raw = pos.get("x") if isinstance(pos, dict) else None
+    if lon_raw is None and isinstance(pos, dict):
+        lon_raw = pos.get("lon")
+    try:
+        lat_val = float(lat_raw) if lat_raw is not None else None
+    except Exception:
+        lat_val = None
+    try:
+        lon_val = float(lon_raw) if lon_raw is not None else None
+    except Exception:
+        lon_val = None
+
+    address_text = _extract_address_from_pos(pos)
+    if not address_text and lat_val is not None and lon_val is not None:
+        try:
+            geocoded = await run_blocking(client.reverse_geocode, lat_val, lon_val)
+        except Exception as exc:
+            geocoded = None
+            log.debug("reverse_geocode call failed: %s", exc)
+        if geocoded:
+            address_text = geocoded
+    coords_text = _format_coords(lat_val, lon_val)
+    location_display = address_text or coords_text or "—"
+    location_map_url = _build_map_url(address=address_text, lat=lat_val, lon=lon_val)
+
+    geozone_label = "Геозона"
+    geozone_display = "вне зон"
+    geozone_map_url: Optional[str] = None
+    primary_zone: Optional[Dict[str, Any]] = None
+    geozone_payload: Dict[str, Any] = {}
+    if lat_val is not None and lon_val is not None:
+        try:
+            geozone_payload = await run_blocking(
+                client.get_unit_geozone_details, unit_id, lat_val, lon_val
+            )
+        except Exception as exc:
+            geozone_payload = {}
+            geo_log.debug("get_unit_geozone_details failed: %s", exc)
+
+    names_ordered: List[str] = []
+    geozone_entries: List[Dict[str, Any]] = []
+    if isinstance(geozone_payload, dict):
+        raw_names = geozone_payload.get("names") or []
+        if isinstance(raw_names, list):
+            for name in raw_names:
+                name_str = str(name).strip()
+                if name_str:
+                    names_ordered.append(name_str)
+        raw_entries = geozone_payload.get("entries") or []
+        if isinstance(raw_entries, list):
+            geozone_entries = [dict(entry) for entry in raw_entries if isinstance(entry, dict)]
+
+    if names_ordered:
+        geozone_label = "Геозоны"
+        display_parts: List[str] = [f"📍 {name}" for name in names_ordered[:GEO_MAX_NAMES]]
+        if len(names_ordered) > GEO_MAX_NAMES:
+            extra = len(names_ordered) - GEO_MAX_NAMES
+            display_parts.append(f"… и ещё {extra}")
+        geozone_display = ", ".join(display_parts)
+        if geozone_entries:
+            primary_zone = dict(geozone_entries[0])
+
+    geo_log.debug(
+        "zones_render: names=%s",
+        ", ".join(names_ordered) if names_ordered else "—",
+    )
+
+    if primary_zone:
+        g_lat = primary_zone.get("lat")
+        g_lon = primary_zone.get("lon")
+        if (g_lat is None or g_lon is None) and primary_zone.get("resource_id") and primary_zone.get("zone_id"):
+            try:
+                center = await run_blocking(
+                    client.get_zone_center,
+                    int(primary_zone["resource_id"]),
+                    int(primary_zone["zone_id"]),
+                )
+            except Exception as exc:
+                center = None
+                geo_log.debug("get_zone_center failed: %s", exc)
+            if center:
+                g_lat, g_lon = center
+                primary_zone["lat"], primary_zone["lon"] = center
+        addr = str(primary_zone.get("name") or "").strip() or None
+        if g_lat is not None and g_lon is not None:
+            geozone_map_url = _build_map_url(address=addr, lat=g_lat, lon=g_lon)
+
+    snapshot_entry = _lookup_unit_snapshot(unit_id) or {}
+    snapshot_record = None  # совместимость с card_features; при отсутствии полноценного объекта не заполняем
+    snapshot_line: Optional[str] = None
+    dump_ts = snapshot_entry.get("dump_ts") or snapshot_entry.get("t")
+    if dump_ts:
+        snapshot_line = f"• Снапшот: unit_snapshot · {_fmt_ts_utc(dump_ts)}"
+
+    try:
+        device_dut_lines = await run_blocking(_build_dut_lines2, client, item, unit_id)
+    except Exception as exc:
+        device_dut_lines = []
+        log.warning("build_dut_lines failed: %s", exc)
+
+    # Собираем карточку через card_features для более полного вывода
+    card_layout = card_features.build_card_layout(
+        unit_name=unit_name,
+        reg_number=None,
+        online_text=online_text,
+        satellites_text=f"{sat_dot} определены {sat_ago} назад ({sats_text})",
+        last_message_text=_fmt_ts_utc(last_ts),
+        fuel_text=fuel_line,
+        driver_text=None,
+        coords_text=coords_text,
+        address_hint=address_text,
+        snapshot_record=snapshot_record,
+        device_dut_lines=device_dut_lines,
+        info_wialon_id=str(unit_id),
+        info_device_type=str(item.get("hw") or item.get("d") or "—"),
+        info_terminal_id=str(item.get("uid") or "—"),
+        unit_config=unit_config,
+        params_map=params_map,
+        sensor_values=sensor_values,
+        location_display=location_display,
+        location_map_url=location_map_url,
+        geozone_display=geozone_display,
+        geozone_map_url=geozone_map_url,
+    )
+
+    lines = list(card_layout.lines)
+    links_map = dict(card_layout.links)
+
+    # Добавляем блок параметров (первые 10)
+    params_entries: List[str] = []
+    if params_map:
+        for key in list(params_map.keys())[:10]:
+            try:
+                val = params_map.get(key)
+                params_entries.append(f"• {key}: {val}")
+            except Exception:
+                continue
+        if params_entries:
+            card_features.append_group(lines, "⚙️ Параметры", params_entries)
+
+    # Добавляем строку про снапшот, если есть
+    if snapshot_line:
+        card_features.append_group(lines, "📦 Снапшот", [snapshot_line])
+
+    message_html = card_features.format_lines_with_links(lines, links_map)
+    target = update_or_q.message
+    msg = await target.reply_text(
+        message_html,
+        reply_markup=kb_stats_actions_with_refresh(),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    card_log.info("card:render_done unit_id=%s lines=%s", unit_id, len(lines))
+    context.user_data["stats_msg"] = {"chat_id": msg.chat_id, "message_id": msg.message_id}
+    _set_objects_mode(context, OBJECTS_MODE_CARD_IDLE)
+    return STATE_WAIT_UNIT
+
+
+def _get_export_anchor(context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict[str, int]]:
+    anchor = context.user_data.get("export_anchor")
+    if not isinstance(anchor, dict):
+        return None
+    chat_id = anchor.get("chat_id")
+    message_id = anchor.get("message_id")
+    if not isinstance(chat_id, int) or not isinstance(message_id, int):
+        return None
+    return {"chat_id": chat_id, "message_id": message_id}
+
+
+async def _set_export_anchor_on(message: Message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["export_anchor"] = {
+        "chat_id": getattr(message, "chat_id", None),
+        "message_id": getattr(message, "message_id", None),
+    }
+
+
+async def delete_export_anchor(context: ContextTypes.DEFAULT_TYPE) -> None:
+    anchor = _get_export_anchor(context)
+    if not anchor:
+        return
+    try:
+        await context.bot.delete_message(chat_id=anchor["chat_id"], message_id=anchor["message_id"])
+    except Exception as exc:
+        log.debug("delete_export_anchor failed: %s", exc)
+    finally:
+        context.user_data.pop("export_anchor", None)
+
+
+async def _handle_nearby_pipeline(
+    q: CallbackQuery,
+    context: ContextTypes.DEFAULT_TYPE,
+    unit_id: int,
+    unit_name: str,
+) -> int:
+    chat_id = q.message.chat_id if q.message else None  # type: ignore[attr-defined]
+    _ensure_settings_defaults(context, chat_id=chat_id)
+    trace_id = f"{unit_id}-{uuid.uuid4().hex[:6]}"
+
+    def _log(stage: str, **fields: Any) -> None:
+        _log_nearby(stage, chat_id=chat_id, unit_id=unit_id, trace=trace_id, **fields)
+
+    _log("start")
+    storage_service = get_pipeline_storage_service()
+    latest = storage_service.get_latest_metrics(unit_id) or {}
+    lat = latest.get("lat")
+    lon = latest.get("lon")
+    if lat is None or lon is None:
+        stats_item = context.user_data.get("stats_unit_item")
+        if isinstance(stats_item, dict):
+            pipeline_event = stats_item.get("pipeline_event") or {}
+            if lat is None:
+                lat = pipeline_event.get("latitude")
+            if lon is None:
+                lon = pipeline_event.get("longitude")
+
+    def _finish(state: int = STATE_WAIT_UNIT) -> int:
+        _set_objects_mode(context, OBJECTS_MODE_CARD_IDLE)
+        _log("finish", state=state)
+        return state
+
+    if lat is None or lon is None:
+        _log("no_coords")
+        await q.message.reply_text(
+            "В локальном кэше нет координат — запустите поток или обновите карточку."
+        )
+        return _finish()
+
+    try:
+        lat_f = float(lat)
+        lon_f = float(lon)
+    except (TypeError, ValueError):
+        _log("bad_coords", lat=lat, lon=lon)
+        await q.message.reply_text("Координаты объекта повреждены, попробуйте обновить поток.")
+        return _finish()
+
+    radius_m = max(1, _get_nearby_radius(context, chat_id=chat_id))
+    if NEARBY_MAX_KM > 0.0:
+        radius_m = min(radius_m, int(NEARBY_MAX_KM * 1000))
+
+    try:
+        nearest = await run_blocking(
+            storage_service.find_nearest_units,
+            lat_f,
+            lon_f,
+            float(radius_m),
+            NEARBY_LIMIT,
+            exclude_unit_id=unit_id,
+        )
+    except Exception as exc:
+        log.exception("pipeline nearby failed")
+        _log("call_failed", error=repr(exc))
+        await q.message.reply_text(
+            f"Не удалось посчитать ближайших (pipeline): `{exc}`",
+            parse_mode="Markdown",
+        )
+        return _finish()
+
+    if not nearest:
+        _log("empty", radius_m=radius_m)
+        await q.message.reply_text(f"В радиусе {radius_m} м около {unit_name} никого нет.")
+        return _finish()
+
+    _log("result", radius_m=radius_m, count=len(nearest))
+    header = (
+        f"Ближайшие к <b>{html.escape(unit_name)}</b> — радиус {radius_m} м (локальные данные)."
+    )
+    lines = [header]
+    for idx, entry in enumerate(nearest, 1):
+        neighbor_name = str(entry.get("nm") or f"id {entry.get('id') or ''}").strip() or f"id {entry.get('id')}"
+        dist_txt = _fmt_distance_m(entry.get("distance_m"))
+        ts = entry.get("device_ts") or entry.get("received_ts")
+        ago_dot, ago_txt = _human_ago(ts)
+        coords_text = _format_coords(entry.get("lat"), entry.get("lon")) or "—"
+        map_url = _build_map_url(lat=entry.get("lat"), lon=entry.get("lon"))
+        base = f"{idx}) {neighbor_name} — {dist_txt} — {ago_dot} {ago_txt}"
+        if coords_text != "—":
+            decorated = f"{base} @ {coords_text}"
+            if map_url:
+                lines.append(_format_line_with_link(decorated, coords_text, map_url))
+            else:
+                lines.append(html.escape(decorated))
+        else:
+            lines.append(html.escape(base))
+
+    await q.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+    return _finish()
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await delete_anchor(context)
+    await delete_stats_message(context)
+    _clear_export_job(context, cancel=True)
+    await delete_export_anchor(context)
+    context.user_data.clear()
+    if not await ensure_authorized(update, context):
+        return STATE_AUTH_WAIT_TOKEN
+
+    await _activate_objects_ui(context)
+    _set_objects_mode(context, OBJECTS_MODE_LIST)
+    _reset_search_context(context)
+
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    greeting_text = (
+        "Привет! Я помогу найти объект, показать его карточку и работать с параметрами."
+    )
+    await update.message.reply_text(
+        greeting_text,
+        reply_markup=reply_menu(chat_id=chat_id),
+    )
+    await send_new_anchor_below(
+        update,
+        "Введите имя/госномер для поиска…",
+        kb_search_prompt(context),
+        context,
+        parse_mode=None,
+    )
+    return STATE_FIND_QUERY
+
+
+async def reports_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await ensure_authorized(update, context):
+        return STATE_AUTH_WAIT_TOKEN
+    client = await require_wialon_client(update, context, "Чтобы формировать отчёты, авторизуйтесь.")
+    if not client:
+        return STATE_AUTH_WAIT_TOKEN
+    return await report_features.reports_entry(update.message, context, client)
+
+
+async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await reports_entry(update, context)
+
+
+async def cmd_web(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    url = WEB_BASE_URL or "http://localhost:8000"
+    text = f"Открыть веб-версию: {url}"
+    if update.message:
+        await update.message.reply_text(text, disable_web_page_preview=False)
+    return ConversationHandler.END
+
+
+async def web_button_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await cmd_web(update, context)
+
+
+def _format_pipeline_summary(day: str, summary: Dict[str, Any], storage_root: Path) -> str:
+    lines = [
+        f"📊 Локальный отчёт за {day}",
+        f"Событий: {summary.get('total_events', 0)}",
+        f"Объектов: {summary.get('units', 0)}",
+    ]
+    span = summary.get('span')
+    if span:
+        lines.append(f"Диапазон: {span // 3600} ч {span % 3600 // 60} мин")
+    first_ts = summary.get('first_ts')
+    last_ts = summary.get('last_ts')
+    if first_ts and last_ts:
+        lines.append(
+            f"UTC: {datetime.fromtimestamp(first_ts, tz=timezone.utc)} → {datetime.fromtimestamp(last_ts, tz=timezone.utc)}"
+        )
+    fuel = summary.get('fuel') or {}
+    if fuel:
+        lines.append(
+            f"Топливо: min {fuel.get('min'):.1f}, max {fuel.get('max'):.1f}, avg {fuel.get('avg'):.1f}, точек {fuel.get('samples')}"
+        )
+    else:
+        lines.append("Топливо: нет подходящих параметров (нужен fuel_param).")
+    lines.append(f"Источник: {storage_root}")
+    return "\n".join(lines)
+
+
+async def pipeline_summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await ensure_authorized(update, context):
+        return ConversationHandler.END
+
+    message = update.effective_message
+    args = getattr(context, "args", []) or []
+    day = args[0] if args else datetime.now(timezone.utc).date().isoformat()
+    try:
+        datetime.fromisoformat(day)
+    except ValueError:
+        if message:
+            await message.reply_text("Укажи дату в формате YYYY-MM-DD, например /pipeline_summary 2025-11-07.")
+        return ConversationHandler.END
+
+    storage_service = get_pipeline_storage_service()
+    try:
+        events = storage_service.fetch_day(day)
+    except Exception as exc:
+        log.exception("pipeline: failed to read events from DB for %s: %s", day, exc)
+        if message:
+            await message.reply_text(f"Не смогли прочитать события из БД: {exc}")
+        return ConversationHandler.END
+
+    if not events:
+        text = (
+            f"⚠️ В БД нет событий за {day}.\n"
+            "Убедись, что stream запущен и пишет события."
+        )
+        if message:
+            await message.reply_text(text)
+        return ConversationHandler.END
+
+    calculator = SensorCalculator()
+    summary = build_day_summary(events, calculator)
+    reply_text = _format_pipeline_summary(day, summary, storage_service.storage_root)
+    if message:
+        await message.reply_text(reply_text)
+    return ConversationHandler.END
+
+
+async def _start_search_prompt_from_trigger(
+    update_or_q,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    await _activate_objects_ui(context)
+    await clear_stats_buttons(context)
+    await delete_anchor(context)
+    await delete_param_result_message(context)
+    clear_param_runtime(context)
+    clear_report_context(context, cancel_job=True)
+    context.user_data.pop("param_result_payload", None)
+    context.user_data.pop("cmd_return", None)
+    context.user_data.pop("cmd_return_payload", None)
+    context.user_data.pop("cmd_return_runtime", None)
+    context.user_data.pop("chosen_unit", None)
+    context.user_data.pop("last_cmd_unit", None)
+    _clear_export_job(context, cancel=True)
+    await delete_export_anchor(context)
+    _reset_search_context(context)
+    context.user_data.pop("last_success_message", None)
+    context.user_data.pop("params_map", None)
+    context.user_data.pop("params_order", None)
+    context.user_data["mode"] = MODE_NONE
+    _set_objects_mode(context, OBJECTS_MODE_LIST)
+    await send_new_anchor_below(
+        update_or_q,
+        "Введите имя/госномер для поиска…",
+        kb_search_prompt(context),
+        context,
+        parse_mode=None,
+    )
+    return STATE_FIND_QUERY
+
+
+async def global_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if _active_ui(context) == UI_ADMIN:
+        text = ""
+        if update.message and update.message.text:
+            text = update.message.text.strip()
+        if text == MENU_BUTTON_FIND:
+            chat = update.effective_chat
+            chat_id = chat.id if chat else None
+            log.info("admin: to_search user=%s -> set UI=OBJECTS", chat_id)
+            panel_state = context.chat_data.get("admin_panel")
+            if isinstance(panel_state, dict):
+                panel_state.pop("awaiting", None)
+            await _activate_objects_ui(context)
+        else:
+            chat = update.effective_chat
+            log.debug("admin: ignore search trigger user=%s", chat.id if chat else None)
+            return ConversationHandler.END
+
+    if context.user_data.get("mode") == MODE_EXPORT:
+        chat = update.effective_chat
+        log.info(
+            "export: auto-cancel on search trigger user=%s",
+            chat.id if chat else None,
+        )
+        _clear_export_job(context, cancel=True)
+        await delete_export_anchor(context)
+        context.user_data["mode"] = MODE_NONE
+    if not await ensure_authorized(update, context):
+        return STATE_AUTH_WAIT_TOKEN
+    return await _start_search_prompt_from_trigger(update, context)
+
+
+async def stats_actions_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    if not q:
+        return STATE_MENU
+    if not await ensure_authorized(update, context):
+        return STATE_AUTH_WAIT_TOKEN
+    action = (q.data or "").split(":", 1)
+    if len(action) < 2:
+        await _safe_answer_callback(q)
+        return STATE_MENU
+    action = action[1]
+    log.info("stats_actions: action=%s", action)
+
+    if action == "to_list":
+        await _safe_answer_callback(q)
+        await clear_stats_buttons(context)
+        _clear_stats_generation(context)
+        await _activate_objects_ui(context)
+        _set_objects_mode(context, OBJECTS_MODE_LIST)
+        await _render_units_page(
+            context,
+            chat_id=q.message.chat_id if q.message else None,
+            offset=context.user_data.get("search_units_offset"),
+            message=q.message,
+            reanchor=True,
+        )
+        return STATE_WAIT_UNIT
+
+    if action == "add_dut":
+        log.info("stats_actions: add_dut flow start")
+        return await add_dut_start(q, context)
+
+    if action == "sensors":
+        return await show_sensor_settings(q, context)
+
+    if action == "dutcal":
+        return await show_dut_calibration(q, context)
+
+    if action == "dutcal_refresh":
+        return await refresh_dut_calibration(q, context)
+
+    if action == "clear_sensors":
+        return await clear_unit_sensors(q, context)
+
+    if action == "report":
+        await _safe_answer_callback(q)
+        clear_report_context(context, cancel_job=True)
+        await q.message.reply_text("Отчёты временно отключены.")
+        return STATE_WAIT_UNIT
+
+    if action == "nearby":
+        await _safe_answer_callback(q)
+        unit = context.user_data.get("chosen_unit")
+        if not unit:
+            await q.message.reply_text("Сначала выберите объект.")
+            return STATE_WAIT_UNIT
+        try:
+            return await _handle_nearby_pipeline(
+                q,
+                context,
+                int(unit.get("id")),
+                str(unit.get("nm")),
+            )
+        except Exception as exc:
+            log.exception("nearby failed: %s", exc)
+            await q.message.reply_text("Ближайшие объекты временно недоступны.")
+            return STATE_WAIT_UNIT
+
+    await _safe_answer_callback(q)
+    return STATE_MENU
+
+
+async def start_action_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    if not q:
+        return STATE_FIND_QUERY
+    action = (q.data or "").partition(":")[2]
+    await _safe_answer_callback(q)
+    if action == "find":
+        if not await ensure_authorized(update, context):
+            return STATE_AUTH_WAIT_TOKEN
+        return await _start_search_prompt_from_trigger(q, context)
+    return ConversationHandler.END
+
+
+async def cancel_inline_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    if not q:
+        return STATE_MENU
+    if not await ensure_authorized(update, context):
+        return STATE_AUTH_WAIT_TOKEN
+    await _safe_answer_callback(q)
+    mode = context.user_data.get("mode")
+
+    if mode == MODE_REPORT:
+        job = context.user_data.get("report_job")
+        message = "Отмена отчёта."
+        if isinstance(job, dict):
+            cancel_event = job.get("cancel_event")
+            if hasattr(cancel_event, "set"):
+                try:
+                    cancel_event.set()
+                except Exception:
+                    pass
+            job["final_message_sent"] = True
+        await edit_anchor(context, message, markup=None, parse_mode=None)
+        context.user_data.pop("anchor", None)
+        await delete_stats_message(context)
+        await delete_param_result_message(context)
+        clear_param_runtime(context)
+        context.user_data.pop("report_job", None)
+        clear_report_context(context, cancel_job=False)
+        if q.message:
+            chat_id = q.message.chat_id
+            await q.message.reply_text(message, reply_markup=reply_menu(chat_id=chat_id))
+        return ConversationHandler.END
+
+    # По умолчанию: вернуть пользователя в карточку, если выбран объект; иначе в поиск
+    unit = context.user_data.get("chosen_unit")
+    if unit:
+        try:
+            unit_id = int(unit.get("id"))
+        except Exception:
+            unit_id = None
+        unit_name = unit.get("nm") or (f"id {unit_id}" if unit_id is not None else "объект")
+        await _activate_objects_ui(context)
+        _set_objects_mode(context, OBJECTS_MODE_CARD_IDLE)
+        await delete_param_result_message(context)
+        clear_param_runtime(context)
+        await delete_stats_message(context)
+        await delete_anchor(context)
+        client = None
+        if not _pipeline_card_enabled():
+            client = await require_wialon_client(
+                update,
+                context,
+                "Чтобы вернуться к карточке, авторизуйтесь.",
+            )
+            if not client:
+                return STATE_AUTH_WAIT_TOKEN
+        return await show_stats_then_actions(
+            update,
+            context,
+            unit_id if unit_id is not None else 0,
+            unit_name,
+            client,
+            preserve_previous=False,
+        )
+
+    # Если объекта нет — в поиск
+    await _activate_objects_ui(context)
+    _set_objects_mode(context, OBJECTS_MODE_LIST)
+    await _start_search_prompt_from_trigger(q, context)
+    return ConversationHandler.END
+
+
+async def back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    if not q:
+        return STATE_MENU
+    if not await ensure_authorized(update, context):
+        return STATE_AUTH_WAIT_TOKEN
+    await _safe_answer_callback(q)
+    parts = (q.data or "").split(":", 1)
+    if len(parts) < 2:
+        return STATE_MENU
+    code = parts[1]
+
+    if code == "menu":
+        await delete_anchor(context)
+        await delete_stats_message(context)
+        await delete_param_result_message(context)
+        clear_param_runtime(context)
+        clear_report_context(context, cancel_job=True)
+        _reset_search_context(context)
+        context.user_data["mode"] = MODE_NONE
+        return STATE_MENU
+
+    if code == "find":
+        await delete_anchor(context)
+        await delete_stats_message(context)
+        await delete_param_result_message(context)
+        clear_param_runtime(context)
+        clear_report_context(context, cancel_job=True)
+        _reset_search_context(context)
+        _set_objects_mode(context, OBJECTS_MODE_LIST)
+        msg = await q.message.reply_text(
+            "Введите имя/госномер для поиска…",
+            reply_markup=kb_search_prompt(context),
+        )
+        await set_anchor_on(msg, context)
+        return STATE_FIND_QUERY
+
+    if code == "unit":
+        context.user_data.pop("cf_stage", None)
+        unit = context.user_data.get("chosen_unit")
+        if not unit:
+            units = _filtered_units(context)
+            if not units:
+                anchor = context.user_data.get("anchor")
+                prompt = "Введите имя/госномер для поиска…"
+                if anchor:
+                    await edit_anchor(context, prompt, kb_search_prompt(context))
+                elif q.message:
+                    msg = await q.message.reply_text(prompt, reply_markup=kb_search_prompt(context))
+                    await set_anchor_on(msg, context)
+                return STATE_FIND_QUERY
+            context.user_data["search_units_offset"] = 0
+            _set_objects_mode(context, OBJECTS_MODE_LIST)
+            await _render_units_page(
+                context,
+                chat_id=q.message.chat_id if q.message else None,
+                offset=0,
+            )
+            return STATE_WAIT_UNIT
+        try:
+            unit_id = int(unit.get("id"))
+        except (TypeError, ValueError):
+            unit_id = None
+        unit_name = str(unit.get("nm") or "").strip() or (f"id {unit_id}" if unit_id is not None else "")
+        context.user_data["mode"] = MODE_NONE
+        client = None
+        if not _pipeline_card_enabled():
+            client = await require_wialon_client(
+                update,
+                context,
+                "Чтобы просматривать объект, авторизуйтесь.",
+            )
+            if not client:
+                return STATE_AUTH_WAIT_TOKEN
+        return await show_stats_then_actions(q, context, unit_id, unit_name, client, via_callback=True)
+
+    if code in ("cmd_unit", "name", "value"):
+        # simplified behavior: reset to menu
+        context.user_data["mode"] = MODE_NONE
+        await delete_anchor(context)
+        await delete_stats_message(context)
+        await delete_param_result_message(context)
+        return STATE_MENU
+
+    await delete_anchor(context)
+    await delete_stats_message(context)
+    await delete_param_result_message(context)
+    _clear_export_job(context, cancel=True)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def _edit_export_anchor(
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    markup: Optional[InlineKeyboardMarkup] = None,
+    parse_mode: Optional[str] = None,
+) -> bool:
+    anchor = _get_export_anchor(context)
+    if not anchor:
+        return False
+    try:
+        await context.bot.edit_message_text(
+            chat_id=anchor["chat_id"],
+            message_id=anchor["message_id"],
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=markup,
+        )
+        return True
+    except Exception as exc:
+        log.debug("edit_export_anchor failed: %s", exc)
+        return False
+
+
+def _clear_export_job(context: ContextTypes.DEFAULT_TYPE, *, cancel: bool = False) -> None:
+    job = context.user_data.pop(EXPORT_JOB_KEY, None)
+    if not cancel:
+        return
+    if isinstance(job, dict):
+        cancel_event = job.get("cancel_event")
+        if hasattr(cancel_event, "set"):
+            try:
+                cancel_event.set()
+            except Exception:
+                pass
+
+async def clear_stats_buttons(context: ContextTypes.DEFAULT_TYPE) -> None:
+    smeta = context.user_data.get("stats_msg")
+    if not smeta:
+        return
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=smeta["chat_id"],
+            message_id=smeta["message_id"],
+            reply_markup=None,
+        )
+    except Exception as exc:
+        log.debug("clear_stats_buttons: %s", exc)
+
+
+async def restore_stats_buttons(context: ContextTypes.DEFAULT_TYPE) -> None:
+    smeta = context.user_data.get("stats_msg")
+    if not smeta:
+        return
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=smeta["chat_id"],
+            message_id=smeta["message_id"],
+            reply_markup=kb_stats_actions_with_refresh(),
+        )
+    except Exception as exc:
+        log.debug("restore_stats_buttons: %s", exc)
+
+
+async def remove_reply_markup_safe(message: Optional[Message]) -> None:
+    if not message:
+        return
+    try:
+        await message.edit_reply_markup(reply_markup=None)
+    except Exception as exc:
+        log.debug("remove_reply_markup_safe: %s", exc)
+
+
+async def remove_reply_markup_by_meta(context: ContextTypes.DEFAULT_TYPE, meta: Optional[Dict[str, Any]]) -> None:
+    if not isinstance(meta, dict):
+        return
+    chat_id = meta.get("chat_id")
+    message_id = meta.get("message_id")
+    if not isinstance(chat_id, int) or not isinstance(message_id, int):
+        return
+    try:
+        await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
+    except Exception as exc:
+        log.debug("remove_reply_markup_by_meta: %s", exc)
+
+T = TypeVar("T")
+
+# =================== AUTH HELPERS ===================
+
+
+class NotAuthorized(Exception):
+    """Raised when a chat doesn't have a stored Wialon token."""
+
+
+class UserBlocked(Exception):
+    """Raised when a chat is blocked from using the bot."""
+
+
+def wialon_for_chat(chat_id: Optional[int]) -> "WialonClient":
+    if chat_id is None:
+        log.warning("Запрос к Wialon без известного chat_id")
+        raise NotAuthorized("chat_id is missing")
+    if token_store.is_blocked(chat_id):
+        log.warning("Попытка обращения к Wialon от заблокированного chat_id=%s", chat_id)
+        raise UserBlocked(f"blocked chat {chat_id}")
+    token = token_store.get_token(chat_id)
+    if not token:
+        log.warning("Попытка обращения к Wialon без авторизации (chat_id=%s)", chat_id)
+        raise NotAuthorized(f"no token for chat {chat_id}")
+    with _WIALON_CLIENT_CACHE_LOCK:
+        cached = _WIALON_CLIENT_CACHE.get(chat_id)
+        if cached and cached.token == token and cached.host == WIALON_HOST:
+            return cached
+        log.debug("Создание клиента Wialon для chat_id=%s", chat_id)
+        client = WialonClient(WIALON_HOST, token)
+        _WIALON_CLIENT_CACHE[chat_id] = client
+        return client
+
+
+async def run_blocking(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    loop = asyncio.get_running_loop()
+    bound = functools.partial(func, *args, **kwargs)
+    return await loop.run_in_executor(EXECUTOR, bound)
+
+
+def _load_access_denied_cache_sync() -> None:
+    global _ACCESS_DENIED_CACHE_LOADED, _ACCESS_DENIED_CACHE
+    with _ACCESS_DENIED_CACHE_LOCK:
+        if _ACCESS_DENIED_CACHE_LOADED:
+            return
+        try:
+            if ACCESS_DENIED_CACHE_PATH.exists():
+                data = json.loads(ACCESS_DENIED_CACHE_PATH.read_text(encoding="utf-8"))
+                _ACCESS_DENIED_CACHE = {
+                    int(item)
+                    for item in data
+                    if isinstance(item, int) or (isinstance(item, str) and item.strip().lstrip("-").isdigit())
+                }
+        except Exception as exc:
+            logging.getLogger("wialon_cf_bot").debug("access_denied cache load failed: %s", exc)
+            _ACCESS_DENIED_CACHE = set()
+        _ACCESS_DENIED_CACHE_LOADED = True
+
+
+def _get_access_denied_cache_snapshot() -> Set[int]:
+    with _ACCESS_DENIED_CACHE_LOCK:
+        return set(_ACCESS_DENIED_CACHE)
+
+
+def _record_access_denied_cache_sync(unit_id: int) -> bool:
+    global _ACCESS_DENIED_CACHE
+    with _ACCESS_DENIED_CACHE_LOCK:
+        if unit_id in _ACCESS_DENIED_CACHE:
+            return False
+        _ACCESS_DENIED_CACHE.add(unit_id)
+        ACCESS_DENIED_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ACCESS_DENIED_CACHE_PATH.write_text(
+            json.dumps(sorted(_ACCESS_DENIED_CACHE)),
+            encoding="utf-8",
+        )
+        return True
+
+
+# Provide the blocking helper to the messages loader so it reuses the shared executor.
+async def require_wialon_client(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    reason: Optional[str] = None,
+) -> Optional["WialonClient"]:
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    try:
+        return wialon_for_chat(chat_id)
+    except NotAuthorized:
+        await prompt_authorization(update, context, reason or "Для работы требуется авторизация в Wialon.")
+        return None
+    except UserBlocked:
+        await notify_blocked_user(update, context)
+        return None
+
+# =================== СОСТОЯНИЯ ===================
+STATE_AUTH_WAIT_TOKEN = 5
+STATE_MENU = 10
+STATE_FIND_QUERY = 20
+STATE_WAIT_UNIT = 30
+STATE_PARAM_QUERY = 70
+STATE_REPORT_NAME = 80
+STATE_REPORT_PERIOD = 81
+STATE_REPORT_FORMAT = 82
+STATE_REPORT_WAIT = 83
+STATE_ADD_DUT_WAIT_NAME = 106
+# Legacy placeholders (не используются в UI, оставлены для совместимости зависимостей)
+STATE_CMD_VALUE = 60
+
+ACTIVE_UI_KEY = "active_ui"
+UI_OBJECTS = "objects"
+UI_ADMIN = "admin"
+
+OBJECTS_MODE_LIST = "LIST"
+OBJECTS_MODE_CARD_IDLE = "CARD_IDLE"
+OBJECTS_MODE_CARD_FLOW_SENSORS = "CARD_FLOW_SENSORS"
+OBJECTS_MODE_CARD_FLOW_NEARBY = "CARD_FLOW_NEARBY"
+
+STATS_GENERATION_KEY = "stats_generation_token"
+STATS_GENERATION_UNIT_KEY = "stats_generation_unit"
+
+# Режимы
+MODE_NONE = "none"
+MODE_PARAMS = "params"
+MODE_REPORT = "report"
+MODE_EXPORT = "export"
+MODE_CMD = "cmd"
+
+# Кнопка внизу
+MENU_BUTTON_FIND = "🔍 Найти объект"
+MENU_BUTTON_ADMIN = "🛠 Админ панель"
+MENU_BUTTON_SETTINGS = "⚙️ Настройки"
+
+ID_QUERY_RE = re.compile(r"^\s*id\s+(\d{1,10})\s*$", re.IGNORECASE)
+AUTH_PROMPT_TEXT = (
+    "Для работы бота требуется авторизация.\n"
+    "Получите токен Wialon (read-only) и отправьте его в ответ одним сообщением."
+)
+
+
+def is_admin_chat(chat_id: Optional[int]) -> bool:
+    if chat_id is None:
+        return False
+    if chat_id in ADMIN_WHITELIST:
+        return True
+    role = token_store.get_admin_role(chat_id)
+    return role in {"admin", "superadmin"}
+
+
+def _hmac_hex(secret: str, data: str) -> str:
+    import hashlib
+    import hmac
+
+    return hmac.new(secret.encode(), data.encode(), hashlib.sha256).hexdigest()
+
+
+def build_login_url(tg_chat_id: int, nonce: str) -> str:
+    redirect_uri = f"{PUBLIC_CALLBACK_URL.rstrip('/')}/wialon/callback?tg_chat_id={tg_chat_id}&nonce={nonce}"
+    if HMAC_SECRET:
+        redirect_uri += f"&sig={_hmac_hex(HMAC_SECRET, f'{tg_chat_id}|{nonce}') }"
+    params = {
+        "access_type": -1,
+        "duration": 0,
+        "redirect_uri": redirect_uri,
+    }
+    return f"{WIALON_LOGIN_HOST.rstrip('/')}/login.html?{urlencode(params, doseq=False, safe='/:?=&')}"
+
+
+def kb_auth_actions() -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    if PUBLIC_CALLBACK_URL:
+        rows.append([InlineKeyboardButton("🎟 Получить токен", callback_data="auth:get_link")])
+    rows.append([InlineKeyboardButton("🔑 У меня есть токен", callback_data="auth:have_token")])
+    return InlineKeyboardMarkup(rows)
+
+
+def looks_like_token(text: str) -> bool:
+    text = (text or "").strip()
+    if len(text) < 32:
+        return False
+    if any(ch.isspace() for ch in text):
+        return False
+    return True
+
+
+async def prompt_authorization(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    reason: Optional[str] = None,
+) -> int:
+    _clear_export_job(context, cancel=True)
+    context.user_data.clear()
+    context.user_data["auth_expected"] = True
+    message_text = AUTH_PROMPT_TEXT
+    if reason:
+        message_text = f"{reason}\n\n{message_text}"
+
+    target_message = update.effective_message
+    if update.callback_query:
+        target_message = update.callback_query.message or target_message
+    if target_message:
+        await target_message.reply_text(message_text, reply_markup=ReplyKeyboardRemove())
+        await target_message.reply_text("Выберите действие:", reply_markup=kb_auth_actions())
+        return STATE_AUTH_WAIT_TOKEN
+
+    chat = update.effective_chat
+    if chat:
+        await chat.send_message(message_text, reply_markup=ReplyKeyboardRemove())
+        await chat.send_message("Выберите действие:", reply_markup=kb_auth_actions())
+    else:
+        log.warning("prompt_authorization вызван без message и callback_query")
+    return STATE_AUTH_WAIT_TOKEN
+
+
+def remember_user(update: Update) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    user = update.effective_user
+    username = None
+    first_name = None
+    last_name = None
+    language_code = None
+    user_id = None
+    is_bot = False
+    if user:
+        username = user.username
+        first_name = user.first_name
+        last_name = user.last_name
+        language_code = user.language_code
+        user_id = user.id
+        is_bot = bool(user.is_bot)
+    else:
+        username = chat.username
+        first_name = getattr(chat, "first_name", None)
+        last_name = getattr(chat, "last_name", None)
+    token_store.upsert_user_profile(
+        chat.id,
+        user_id,
+        username,
+        first_name,
+        last_name,
+        language_code,
+        is_bot,
+    )
+
+
+async def notify_blocked_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    if update.callback_query:
+        try:
+            await _safe_answer_callback(update.callback_query, "Вы заблокированы", show_alert=True)
+        except Exception:
+            pass
+        message = "\u0414\u0435\u0439\u0441\u0442\u0432\u0438\u0435 \u043e\u0442\u043c\u0435\u043d\u0435\043d\u043e."
+    else:
+        message = "\u0414\u0435\u0439\u0441\u0442\u0432\u0438\u0435 \u043e\u0442\u043c\u0435\u043d\u0435\043d\u043e."
+    if message:
+        try:
+            await message.reply_text("🚫 Вы заблокированы. Свяжитесь с поддержкой.")
+        except Exception:
+            log.debug("Не удалось отправить уведомление о блокировке для chat_id=%s", chat.id)
+
+
+async def ensure_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat = update.effective_chat
+    remember_user(update)
+    if chat and token_store.has_token(chat.id):
+        if token_store.is_blocked(chat.id):
+            await notify_blocked_user(update, context)
+            return False
+        return True
+    if chat and token_store.is_blocked(chat.id):
+        await notify_blocked_user(update, context)
+        return False
+    await prompt_authorization(update, context)
+    return False
+
+
+def verify_wialon_token_sync(token: str) -> Tuple[bool, Optional[str]]:
+    client = WialonClient(WIALON_HOST, token)
+    try:
+        client.login()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+async def auth_token_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    message = update.message
+    if not message:
+        return STATE_AUTH_WAIT_TOKEN
+    remember_user(update)
+    chat = update.effective_chat
+    if chat and token_store.is_blocked(chat.id):
+        await notify_blocked_user(update, context)
+        return STATE_AUTH_WAIT_TOKEN
+    token = (message.text or "").strip()
+    if not token:
+        await message.reply_text("Пришлите токен одной строкой.")
+        return STATE_AUTH_WAIT_TOKEN
+    await message.reply_text("⏳ Проверяю токен…")
+    loop = asyncio.get_running_loop()
+    token_tail = token[-6:] if token else ""
+    log.info(
+        "auth: verifying token tail=%s chat=%s host=%s",
+        token_tail,
+        chat.id if chat else None,
+        WIALON_HOST,
+    )
+    ok, err = await loop.run_in_executor(EXECUTOR, verify_wialon_token_sync, token)
+    if not ok:
+        log.warning(
+            "Token verification failed: %s (host=%s tail=%s chat=%s)",
+            err,
+            WIALON_HOST,
+            token_tail,
+            chat.id if chat else None,
+        )
+        await message.reply_text(
+            "❌ Не удалось проверить токен. Убедитесь, что вставили его полностью и попробуйте снова.",
+        )
+        return STATE_AUTH_WAIT_TOKEN
+
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else None
+    token_store.save_token(chat_id, user_id, token)
+    log.info(
+        "auth: token saved chat=%s tail=%s host=%s",
+        chat_id,
+        token_tail,
+        WIALON_HOST,
+    )
+    _clear_export_job(context, cancel=True)
+    context.user_data.clear()
+
+    greeting_text = (
+        "✅ Токен принят! Привет! Я помогу найти объект, показать его карточку и работать с параметрами."
+    )
+    await message.reply_text(
+        greeting_text,
+        reply_markup=reply_menu(chat_id=chat_id),
+    )
+
+    return await _start_search_prompt_from_trigger(update, context)
+
+
+async def auth_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    if not q:
+        return STATE_AUTH_WAIT_TOKEN
+    await _safe_answer_callback(q)
+    chat = q.message.chat if q.message else None
+    remember_user(update)
+    if chat and token_store.is_blocked(chat.id):
+        await notify_blocked_user(update, context)
+        return STATE_AUTH_WAIT_TOKEN
+    if q.data == "auth:get_link":
+        if not PUBLIC_CALLBACK_URL:
+            await q.message.reply_text(
+                "Параметр PUBLIC_CALLBACK_URL не настроен. Свяжитесь с администратором.",
+            )
+        else:
+            nonce = uuid.uuid4().hex
+            url = build_login_url(chat.id if chat else 0, nonce)
+            await q.message.reply_html(
+                "<b>Шаг 1.</b> Перейдите по ссылке и авторизуйтесь в Wialon.\n"
+                "После авторизации токен придёт в этот чат от облачного сервиса.\n\n"
+                "Скопируйте токен и отправьте его сюда одной строкой.\n\n"
+                f"<a href=\"{url}\">Открыть страницу логина Wialon</a>",
+            )
+    elif q.data == "auth:have_token":
+        await q.message.reply_text("Отправьте токен сообщением — я его проверю и сохраню.")
+    return STATE_AUTH_WAIT_TOKEN
+
+# =================== Wialon ===================
+ONLINE_THRESHOLD_SEC = 10 * 60  # 10 минут для «На связи»
+YANDEX_STATIC_MAP_ZOOM = 15
+YANDEX_STATIC_MAP_SIZE = (600, 400)
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+
+MONTH_NAME_TO_NUM: Dict[str, int] = {
+    "январь": 1,
+    "января": 1,
+    "янв": 1,
+    "февраль": 2,
+    "февраля": 2,
+    "фев": 2,
+    "март": 3,
+    "марта": 3,
+    "мар": 3,
+    "апрель": 4,
+    "апреля": 4,
+    "апр": 4,
+    "май": 5,
+    "мая": 5,
+    "июнь": 6,
+    "июня": 6,
+    "июн": 6,
+    "июл": 7,
+    "июль": 7,
+    "июля": 7,
+    "август": 8,
+    "августа": 8,
+    "авг": 8,
+    "сентябрь": 9,
+    "сентября": 9,
+    "сен": 9,
+    "октябрь": 10,
+    "октября": 10,
+    "окт": 10,
+    "ноябрь": 11,
+    "ноября": 11,
+    "ноя": 11,
+    "декабрь": 12,
+    "декабря": 12,
+    "дек": 12,
+}
+# Дополнительные эвристики распознавания датчиков уровня топлива
+RE_DETECTOR_DUT_NAME = re.compile(
+    r"(?:\bДУТ\b|\bDUT\b|\bLLS\b|fuel\s*level)", re.IGNORECASE
+)
+DUT_TYPE_ALIASES = {
+    "lls",
+    "fuel",
+    "fuel_level",
+    "fuel level",
+    "flevel",
+    "dut",
+}
+ZONE_DATA_CACHE_TTL = 300
+class ReportCancelledError(Exception):
+    """Исключение, используемое для прерывания генерации отчёта."""
+
+def _geocode_bucket_key(lat: float, lon: float) -> Tuple[float, float, int]:
+    t_bucket = int(time.time() // GEOCODE_TTL_SEC_BUCKET)
+    return (round(float(lat), 4), round(float(lon), 4), t_bucket)
+
+
+# =================== REPLY/INLINE UI ===================
+def reply_menu(chat_id: Optional[int] = None) -> ReplyKeyboardMarkup:
+    row: List[KeyboardButton] = [
+        KeyboardButton(MENU_BUTTON_FIND),
+        KeyboardButton(MENU_BUTTON_SETTINGS),
+        KeyboardButton("🌐 WEB"),
+    ]
+    if is_admin_chat(chat_id):
+        row.append(KeyboardButton(MENU_BUTTON_ADMIN))
+    buttons: List[List[KeyboardButton]] = [row]
+    return ReplyKeyboardMarkup(
+        buttons,
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Нажмите «🔍 Найти объект»…",
+    )
+
+
+def _settings_summary(context: ContextTypes.DEFAULT_TYPE) -> str:
+    radius = _get_nearby_radius(context)
+    lines = ["Настройки:", f"• Ближайшие объекты: {radius} м"]
+    unit_info = _build_settings_unit_info(context)
+    if unit_info:
+        lines.append("")
+        lines.extend(unit_info)
+    return "\n".join(lines)
+
+
+def _settings_nearby_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    radius = _get_nearby_radius(context)
+    return (
+        "Ближайшие объекты.\n"
+        f"Текущий радиус: {radius} м.\n"
+        "Используйте кнопки ниже, чтобы изменить значение."
+    )
+
+
+def _build_settings_unit_info(context: ContextTypes.DEFAULT_TYPE) -> List[str]:
+    unit_id = _current_unit_id(context)
+    if unit_id is None:
+        return []
+    config = _load_unit_config(unit_id)
+    if not config:
+        return []
+    lines = [f"Текущий объект: {config.general.name if config.general and config.general.name else f'id {unit_id}'}"]
+    general = config.general
+    if general:
+        if general.uid:
+            lines.append(f" UID: {general.uid}")
+        if general.hardware:
+            lines.append(f" Устройство: {general.hardware}")
+    if config.hw_config and config.hw_config.hardware and (not general or config.hw_config.hardware != general.hardware):
+        lines.append(f" HW конфиг: {config.hw_config.hardware}")
+    sensor_count = len(config.sensors)
+    if sensor_count:
+        lines.append(f" Сенсоров в конфиге: {sensor_count}")
+    return lines
+
+
+def _format_unit_config_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    unit_id = _current_unit_id(context)
+    if unit_id is None:
+        return "Нет выбранного объекта. Вернитесь к списку и выберите объект."
+    config = _load_unit_config(unit_id)
+    if not config:
+        return "Для выбранного объекта нет локального UnitConfig. Импортируйте .wlp и повторите попытку."
+    lines = [f"<b>UnitConfig — объект {unit_id}</b>"]
+    general = config.general
+    if general:
+        lines.append(f"Имя: {general.name or '—'}")
+        if general.uid:
+            lines.append(f"UID/IMEI: {general.uid}")
+        if general.phone:
+            lines.append(f"SIM: {general.phone}")
+    hw = config.hw_config
+    if hw:
+        lines.append("")
+        lines.append("<b>Аппаратные параметры</b>")
+        if hw.hardware:
+            lines.append(f"• Устройство: {hw.hardware}")
+        for param in hw.params[:5]:
+            title = param.label or param.name
+            if not title:
+                continue
+            value = param.value
+            display = value if value not in (None, "") else param.default
+            lines.append(f"• {title}: {display}")
+        if len(hw.params) > 5:
+            lines.append(f"… и ещё {len(hw.params) - 5}")
+    if config.sensors:
+        lines.append("")
+        lines.append("<b>Сенсоры</b>")
+        for sensor in config.sensors[:5]:
+            desc_parts = []
+            if sensor.type:
+                desc_parts.append(sensor.type)
+            if sensor.units:
+                desc_parts.append(sensor.units)
+            desc = f" ({', '.join(desc_parts)})" if desc_parts else ""
+            lines.append(f"• {sensor.name}{desc}")
+        if len(config.sensors) > 5:
+            lines.append(f"… и ещё {len(config.sensors) - 5}")
+    return "\n".join(lines)
+
+
+def _current_unit_id(context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    chosen = context.user_data.get("chosen_unit")
+    if isinstance(chosen, dict):
+        try:
+            return int(chosen.get("id"))
+        except Exception:
+            return None
+    return None
+
+
+def _current_unit_has_config(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    unit_id = _current_unit_id(context)
+    if unit_id is None:
+        return False
+    return _load_unit_config(unit_id) is not None
+
+
+def kb_settings_main(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    radius = _get_nearby_radius(context)
+    rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(f"Ближайшие объекты ({radius} м)", callback_data="settings:nearby")]
+    ]
+    if _current_unit_has_config(context):
+        rows.append([InlineKeyboardButton("Свойства UnitConfig", callback_data="settings:unitcfg")])
+    rows.append([InlineKeyboardButton("Закрыть", callback_data="settings:close")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_settings_nearby(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("−50 м", callback_data="settings:radius:-"),
+                InlineKeyboardButton("Сброс 100 м", callback_data="settings:radius:reset"),
+                InlineKeyboardButton("+50 м", callback_data="settings:radius:+"),
+            ],
+            [InlineKeyboardButton("Назад", callback_data="settings:back")],
+        ]
+    )
+
+
+def kb_settings_unit_config() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="settings:back")]])
+
+
+async def settings_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    remember_user(update)
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    _ensure_settings_defaults(context, chat_id=chat_id)
+    text = _settings_summary(context)
+    markup = kb_settings_main(context)
+    message = await update.message.reply_text(text, reply_markup=markup, parse_mode=None)
+    context.user_data["settings_msg"] = {"chat_id": message.chat_id, "message_id": message.message_id}
+    return _objects_mode_to_state(context)
+
+
+async def settings_buttons_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    parts = (q.data or "").split(":", 1)
+    action = parts[1] if len(parts) > 1 else ""
+    await _safe_answer_callback(q)
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    _ensure_settings_defaults(context, chat_id=chat_id)
+
+    if action == "close":
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        context.user_data.pop("settings_msg", None)
+        return _objects_mode_to_state(context)
+
+    if action == "add_dut":
+        return await add_dut_start(q, context)
+
+    if action == "add_dut":
+        return await add_dut_start(q, context)
+
+    if action == "nearby":
+        await q.edit_message_text(_settings_nearby_text(context), reply_markup=kb_settings_nearby(context))
+        return _objects_mode_to_state(context)
+    if action == "unitcfg":
+        text = _format_unit_config_text(context)
+        await q.edit_message_text(text, reply_markup=kb_settings_unit_config(), parse_mode="HTML")
+        return _objects_mode_to_state(context)
+
+    if action == "back":
+        await q.edit_message_text(_settings_summary(context), reply_markup=kb_settings_main(context))
+        return _objects_mode_to_state(context)
+
+    if action == "radius:+":
+        _set_nearby_radius(context, _get_nearby_radius(context) + NEARBY_RADIUS_STEP_M, chat_id=chat_id)
+        await q.edit_message_text(_settings_nearby_text(context), reply_markup=kb_settings_nearby(context))
+        return _objects_mode_to_state(context)
+
+    if action == "radius:-":
+        _set_nearby_radius(context, _get_nearby_radius(context) - NEARBY_RADIUS_STEP_M, chat_id=chat_id)
+        await q.edit_message_text(_settings_nearby_text(context), reply_markup=kb_settings_nearby(context))
+        return _objects_mode_to_state(context)
+
+    if action == "radius:reset":
+        _set_nearby_radius(context, DEFAULT_NEARBY_RADIUS_M, chat_id=chat_id)
+        await q.edit_message_text(_settings_nearby_text(context), reply_markup=kb_settings_nearby(context))
+        return _objects_mode_to_state(context)
+
+    return _objects_mode_to_state(context)
+
+
+
+
+
+
+def kb_start_actions() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(MENU_BUTTON_FIND, callback_data="start:find")]]
+    )
+
+def kb_cancel(back_code: Optional[str] = None) -> InlineKeyboardMarkup:
+    row = []
+    if back_code:
+        row.append(InlineKeyboardButton("⬅️ Назад", callback_data=back_code))
+    row.append(InlineKeyboardButton("❌ Отмена", callback_data="action:cancel"))
+    return InlineKeyboardMarkup([row])
+
+
+def kb_search_prompt(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    # Минимальный промпт поиска: только «Отмена» (или «Назад», если задано).
+    return kb_cancel()
+
+
+def kb_cmd_entry_controls(back_code: str = "back:cmd_unit") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("↩️ К карточке", callback_data=back_code),
+                InlineKeyboardButton("🔍 Новый поиск", callback_data="back:find"),
+            ]
+        ]
+    )
+
+
+def kb_export_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Закрыть", callback_data="export:cancel")]])
+
+
+def _unit_status_markers(unit: Dict[str, Any]) -> Tuple[str, str]:
+    last_ts: Optional[int] = None
+    if isinstance(unit, dict):
+        lmsg = unit.get("lmsg")
+        if isinstance(lmsg, dict):
+            ts = lmsg.get("t")
+            try:
+                last_ts = int(ts) if ts is not None else None
+            except (TypeError, ValueError):
+                last_ts = None
+        if last_ts is None:
+            pos = unit.get("pos")
+            if isinstance(pos, dict):
+                ts = pos.get("t")
+                try:
+                    last_ts = int(ts) if ts is not None else None
+                except (TypeError, ValueError):
+                    last_ts = None
+
+    online = _is_online(last_ts)
+    online_dot = "🟢" if online else "🔴"
+
+    pos_ts: Optional[int] = None
+    if isinstance(unit, dict):
+        pos = unit.get("pos")
+        if isinstance(pos, dict):
+            ts = pos.get("t")
+            try:
+                pos_ts = int(ts) if ts is not None else None
+            except (TypeError, ValueError):
+                pos_ts = None
+    if pos_ts is None:
+        pos_ts = last_ts
+    sat_dot, _ = _human_ago(pos_ts)
+    return online_dot, sat_dot
+
+
+def _get_search_units(context: ContextTypes.DEFAULT_TYPE) -> List[Dict[str, Any]]:
+    return search_features.get_units(context)
+
+
+def _filtered_units(context: ContextTypes.DEFAULT_TYPE) -> List[Dict[str, Any]]:
+    return search_features.filtered_units(context)
+
+
+def _reset_search_context(context: ContextTypes.DEFAULT_TYPE) -> None:
+    search_features.reset_search_context(
+        context,
+        extra_keys=["stats_unit_item"],
+        after_reset=_clear_stats_generation,
+    )
+
+
+def _objects_mode(context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    return context.user_data.get("objects_mode")
+
+
+def _set_objects_mode(context: ContextTypes.DEFAULT_TYPE, mode: Optional[str]) -> None:
+    if mode is None:
+        context.user_data.pop("objects_mode", None)
+    else:
+        context.user_data["objects_mode"] = mode
+
+
+def _anchor_message_id(context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    anchor = context.user_data.get("anchor")
+    if not anchor:
+        return None
+    message_id = anchor.get("message_id")
+    try:
+        return int(message_id)
+    except (TypeError, ValueError):
+        return message_id
+
+
+def _set_stats_generation(context: ContextTypes.DEFAULT_TYPE, unit_id: int) -> str:
+    token = uuid.uuid4().hex
+    context.user_data[STATS_GENERATION_KEY] = token
+    context.user_data[STATS_GENERATION_UNIT_KEY] = unit_id
+    return token
+
+
+def _current_stats_generation(context: ContextTypes.DEFAULT_TYPE) -> Tuple[Optional[str], Optional[int]]:
+    token = context.user_data.get(STATS_GENERATION_KEY)
+    unit_id = context.user_data.get(STATS_GENERATION_UNIT_KEY)
+    try:
+        unit_id_int = int(unit_id) if unit_id is not None else None
+    except (TypeError, ValueError):
+        unit_id_int = None
+    return (str(token) if token is not None else None, unit_id_int)
+
+
+def _clear_stats_generation(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop(STATS_GENERATION_KEY, None)
+    context.user_data.pop(STATS_GENERATION_UNIT_KEY, None)
+
+
+def _objects_mode_to_state(context: ContextTypes.DEFAULT_TYPE) -> int:
+    mode = _objects_mode(context)
+    if mode == OBJECTS_MODE_LIST:
+        return STATE_WAIT_UNIT
+    return STATE_FIND_QUERY
+
+
+
+async def _render_units_page(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: Optional[int] = None,
+    offset: Optional[int] = None,
+    update: Optional[Update] = None,
+    message: Optional[Message] = None,
+    reanchor: bool = False,
+) -> None:
+    if _active_ui(context) != UI_OBJECTS:
+        return
+    units = search_features.filtered_units(context)
+    total = len(units)
+    if offset is None:
+        offset = context.user_data.get("search_units_offset") or 0
+    normalized_offset = search_features.normalize_units_offset(total, int(offset))
+    context.user_data["search_units_offset"] = normalized_offset
+    if total:
+        markup = search_features.kb_units_page(
+            units, normalized_offset, status_marker=_unit_status_markers
+        )
+    else:
+        markup = kb_search_prompt(context)
+    text = search_features.list_header(total)
+    anchor = context.user_data.get("anchor")
+    target_message = message
+    if target_message is None and update is not None:
+        target_message = update.effective_message
+    if reanchor:
+        if target_message is not None:
+            await delete_anchor(context)
+            try:
+                msg = await target_message.reply_text(
+                    text,
+                    reply_markup=markup,
+                    parse_mode=None,
+                )
+            except Exception as exc:
+                log.debug("reanchor units via reply failed: %s", exc)
+            else:
+                await set_anchor_on(msg, context)
+                return
+        if chat_id is not None:
+            await delete_anchor(context)
+            msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=markup,
+                parse_mode=None,
+            )
+            await set_anchor_on(msg, context)
+            return
+    if anchor:
+        await edit_anchor(context, text, markup, parse_mode=None)
+        return
+    if target_message is not None:
+        msg = await target_message.reply_text(text, reply_markup=markup, parse_mode=None)
+        await set_anchor_on(msg, context)
+        return
+    if chat_id is None:
+        return
+    msg = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup, parse_mode=None)
+    await set_anchor_on(msg, context)
+
+
+async def _handle_objects_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    card_log.info(
+        "card:text ui=%s mode=%s text=%s chat=%s",
+        _active_ui(context),
+        _objects_mode(context),
+        (update.message.text if update.message else None),
+        update.effective_chat.id if update.effective_chat else None,
+    )
+    if _active_ui(context) == UI_ADMIN:
+        chat = update.effective_chat
+        log.debug(
+            "admin: ignore object text user=%s",
+            chat.id if chat else None,
+        )
+        return _objects_mode_to_state(context)
+
+    if update.message and (update.message.text or "").strip() == MENU_BUTTON_SETTINGS:
+        return await settings_entry(update, context)
+
+    await _activate_objects_ui(context)
+    text = (update.message.text or "").strip()
+    mode = _objects_mode(context) or OBJECTS_MODE_LIST
+    if mode == OBJECTS_MODE_CARD_IDLE:
+        await clear_stats_buttons(context)
+        _clear_stats_generation(context)
+        _set_objects_mode(context, OBJECTS_MODE_LIST)
+    elif mode not in {OBJECTS_MODE_LIST, OBJECTS_MODE_CARD_IDLE}:
+        return STATE_WAIT_UNIT
+
+    search_token = search_features.bump_search_generation(context)
+
+    if not text:
+        await send_new_anchor_below(
+            update,
+            "Введите минимум 3 символа для поиска",
+            kb_search_prompt(context),
+            context,
+            parse_mode=None,
+        )
+        return STATE_FIND_QUERY
+
+    id_match = ID_QUERY_RE.match(text)
+    if id_match:
+        unit_id = int(id_match.group(1))
+        cached = _lookup_unit_snapshot(unit_id) or {}
+        unit_name = str(cached.get("nm") or f"id {unit_id}")
+        context.user_data["chosen_unit"] = {"id": unit_id, "nm": unit_name}
+        _set_objects_mode(context, OBJECTS_MODE_CARD_IDLE)
+        await delete_anchor(context)
+        client = None
+        if not _pipeline_card_enabled():
+            client = await require_wialon_client(
+                update,
+                context,
+                "Need Wialon access to show card.",
+            )
+            if not client:
+                return STATE_AUTH_WAIT_TOKEN
+        return await show_stats_then_actions(
+            update,
+            context,
+            unit_id,
+            unit_name,
+            client,
+            preserve_previous=True,
+        )
+
+
+    if len(text) < 3:
+        units = search_features.get_units(context)
+        search_features.set_quick_mask(context, text)
+        if units:
+            context.user_data["search_units_offset"] = 0
+            _set_objects_mode(context, OBJECTS_MODE_LIST)
+            await _render_units_page(
+                context,
+                chat_id=update.effective_chat.id if update.effective_chat else None,
+                update=update,
+                reanchor=True,
+                offset=0,
+            )
+            return STATE_WAIT_UNIT
+        await send_new_anchor_below(
+            update,
+            "Нужно минимум 3 символа для поиска.",
+            kb_search_prompt(context),
+            context,
+            parse_mode=None,
+        )
+        return STATE_FIND_QUERY
+
+    await edit_anchor(context, "Ищем по базе…", kb_search_prompt(context), parse_mode=None)
+    anchor_message_id = _anchor_message_id(context)
+
+    if _pipeline_search_enabled():
+        try:
+            units = await run_blocking(
+                _search_units_locally, text, search_features.SEARCH_UNITS_LIMIT
+            )
+        except Exception as exc:
+            log.exception("pipeline search failed: %s", exc)
+            await send_new_anchor_below(
+                update,
+                "Локальный поиск временно недоступен. Повторите попытку позже.",
+                kb_search_prompt(context),
+                context,
+                parse_mode=None,
+            )
+            return STATE_FIND_QUERY
+        return await _present_search_results(
+            update,
+            context,
+            units,
+            search_token=search_token,
+            client=None,
+            anchor_message_id=anchor_message_id,
+        )
+
+    client = await require_wialon_client(
+        update,
+        context,
+        "Чтобы искать объекты, авторизуйтесь в Wialon.",
+    )
+    if not client:
+        return STATE_AUTH_WAIT_TOKEN
+
+    try:
+        units = await run_blocking(
+            client.search_units, text, limit=search_features.SEARCH_UNITS_LIMIT
+        )
+    except Exception as exc:
+        if search_token != search_features.current_search_generation(context):
+            log.debug("Stale search error ignored for %s: %s", text, exc)
+            return _objects_mode_to_state(context)
+        log.exception("Ошибка поиска units (router)")
+        await send_new_anchor_below(
+            update,
+            f"Ошибка поиска в Wialon: {exc}",
+            kb_search_prompt(context),
+            context,
+        )
+        return STATE_FIND_QUERY
+
+    return await _present_search_results(
+        update,
+        context,
+        units,
+        search_token=search_token,
+        client=client,
+        anchor_message_id=anchor_message_id,
+    )
+
+
+async def choose_unit_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    if not q:
+        return STATE_WAIT_UNIT
+    data = q.data or ""
+    if data.startswith("units:more:"):
+        try:
+            offset = int(data.split(":", 2)[2])
+        except Exception:
+            offset = 0
+        await _render_units_page(
+            context,
+            chat_id=q.message.chat_id if q.message else None,
+            offset=offset,
+            message=q.message,
+            reanchor=True,
+        )
+        return STATE_WAIT_UNIT
+
+    if not data.startswith("unit:"):
+        await _safe_answer_callback(q)
+        return STATE_WAIT_UNIT
+
+    unit_id_str = data.split(":", 1)[1]
+    try:
+        unit_id = int(unit_id_str)
+    except Exception:
+        await _safe_answer_callback(q)
+        return STATE_WAIT_UNIT
+
+    selected = context.user_data.get("search_results", {}).get(unit_id_str) or {"id": unit_id, "nm": f"id {unit_id}"}
+    context.user_data["chosen_unit"] = {"id": unit_id, "nm": selected.get("nm", f"id {unit_id}")}
+    _set_objects_mode(context, OBJECTS_MODE_CARD_IDLE)
+    await delete_anchor(context)
+
+    client = None
+    if not _pipeline_card_enabled():
+        client = await require_wialon_client(
+            update,
+            context,
+            "Чтобы просматривать объект, авторизуйтесь.",
+        )
+        if not client:
+            return STATE_AUTH_WAIT_TOKEN
+
+    return await show_stats_then_actions(
+        q,
+        context,
+        unit_id,
+        context.user_data["chosen_unit"].get("nm", f"id {unit_id}"),
+        client,
+        via_callback=True,
+        preserve_previous=True,
+    )
+
+STATS_ACTIONS_PATTERN = r"^stats:(refresh|params|report|nearby|to_list|add_dut|sensors|dutcal|dutcal_refresh|clear_sensors)$"
+
+
+def kb_stats_actions() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📑 Отчёт", callback_data="stats:report"),
+                InlineKeyboardButton("📍 Ближайшие объекты", callback_data="stats:nearby"),
+            ],
+            [InlineKeyboardButton("⚙️ Параметры", callback_data="stats:params")],
+            [InlineKeyboardButton("➕ Добавить ДУТ", callback_data="stats:add_dut")],
+            [InlineKeyboardButton("🔧 Настройки датчиков", callback_data="stats:sensors")],
+            [InlineKeyboardButton("🗑 Очистить датчики", callback_data="stats:clear_sensors")],
+            [InlineKeyboardButton("📈 Тарировка ДУТ", callback_data="stats:dutcal")],
+        ]
+    )
+
+
+async def report_name_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get("mode") != MODE_REPORT:
+        return STATE_MENU
+    if not await ensure_authorized(update, context):
+        return STATE_AUTH_WAIT_TOKEN
+    client = await require_wialon_client(update, context, "Чтобы формировать отчёты, авторизуйтесь.")
+    if not client:
+        return STATE_AUTH_WAIT_TOKEN
+
+    query = (update.message.text or "").strip()
+    if len(query) < 5:
+        await send_new_anchor_below(
+            update,
+            "Название отчёта должно содержать минимум 5 символов. Попробуйте ещё раз.",
+            kb_cancel(),
+            context,
+            parse_mode=None,
+        )
+        return STATE_REPORT_NAME
+
+    try:
+        templates = _ensure_report_templates(context, client)
+    except Exception as e:
+        log.exception("Ошибка обновления списка шаблонов отчётов")
+        await send_new_anchor_below(
+            update,
+            f"Не удалось обновить список отчётов: `{e}`",
+            kb_cancel(),
+            context,
+            parse_mode="Markdown",
+        )
+        return STATE_REPORT_NAME
+
+    context.user_data["report_last_query"] = query
+    context.user_data["report_search_mask"] = query
+
+    query_cf = query.casefold()
+    matches: List[Dict[str, Any]] = []
+    for tpl in templates:
+        name = (tpl.get("name") or "").strip()
+        if not name:
+            continue
+        if query_cf in name.casefold():
+            matches.append(tpl)
+
+    exact = None
+    for tpl in matches:
+        name = (tpl.get("name") or "").strip()
+        if name.casefold() == query_cf:
+            exact = tpl
+            break
+
+    if exact:
+        context.user_data["report_selected_template"] = dict(exact)
+        context.user_data["report_last_template"] = dict(exact)
+        context.user_data.pop("report_matches", None)
+        context.user_data.pop("report_offset", None)
+        context.user_data.pop("report_candidates_text", None)
+        label = report_features.format_report_label(exact)
+        text = f"Выбран отчёт: {label}\n\nВыберите период формирования:".strip()
+        await send_new_anchor_below(update, text, report_features.kb_report_periods(), context, parse_mode=None)
+        return STATE_REPORT_PERIOD
+
+    if matches:
+        text = "Совпадения не найдены точно. Выберите отчёт из списка:"
+        markup = report_features.store_report_candidates(context, matches, text, offset=0)
+        await send_new_anchor_below(update, text, markup, context, parse_mode=None)
+        return STATE_REPORT_NAME
+
+    if templates:
+        text = "❌ Совпадений не найдено. Ниже доступные отчёты:"
+        markup = report_features.store_report_candidates(context, templates, text, offset=0)
+        await send_new_anchor_below(update, text, markup, context, parse_mode=None)
+    else:
+        await send_new_anchor_below(
+            update,
+            "❌ Шаблоны отчётов отсутствуют. Попробуйте позже.",
+            kb_cancel(),
+            context,
+            parse_mode=None,
+        )
+    return STATE_REPORT_NAME
+
+async def report_choose_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get("mode") != MODE_REPORT:
+        return STATE_MENU
+    q = update.callback_query
+    if not await ensure_authorized(update, context):
+        return STATE_AUTH_WAIT_TOKEN
+    await _safe_answer_callback(q)
+
+    data = q.data or ""
+    if data.startswith("report:more:"):
+        try:
+            _, _, raw_offset = data.split(":", 2)
+            offset = int(raw_offset)
+        except (ValueError, AttributeError):
+            return STATE_REPORT_NAME
+        matches = context.user_data.get("report_matches") or []
+        if not matches:
+            await _safe_answer_callback(q, "Список отчётов пуст", show_alert=True)
+            return STATE_REPORT_NAME
+        markup = report_features.build_report_candidates_markup(context, offset=offset)
+        text = context.user_data.get("report_candidates_text") or "Выберите отчёт из списка:"
+        await edit_anchor(context, text, markup, parse_mode=None)
+        return STATE_REPORT_NAME
+
+    if not data.startswith("report:choose:"):
+        return STATE_REPORT_NAME
+
+    try:
+        idx = int(data.split(":", 2)[2])
+    except (ValueError, AttributeError):
+        return STATE_REPORT_NAME
+
+    matches = context.user_data.get("report_matches") or []
+    if idx < 0 or idx >= len(matches):
+        return STATE_REPORT_NAME
+
+    selected = dict(matches[idx])
+    context.user_data["report_selected_template"] = selected
+    context.user_data["report_last_template"] = dict(selected)
+    context.user_data.pop("report_matches", None)
+    context.user_data.pop("report_offset", None)
+    context.user_data.pop("report_candidates_text", None)
+    label = report_features.format_report_label(selected)
+    text = (
+        "Выбран отчёт: {label}\n\n"
+        "Выберите период формирования или нажмите «🔁 Другой шаблон», чтобы вернуться к списку."
+    ).format(label=label)
+    await edit_anchor(context, text, report_features.kb_report_periods(), parse_mode=None)
+    return STATE_REPORT_PERIOD
+
+
+async def report_change_template_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get("mode") != MODE_REPORT:
+        return STATE_MENU
+
+    q = update.callback_query
+    if not await ensure_authorized(update, context):
+        return STATE_AUTH_WAIT_TOKEN
+    await _safe_answer_callback(q)
+
+    client = await require_wialon_client(update, context, "Чтобы формировать отчёты, авторизуйтесь.")
+    if not client:
+        return STATE_AUTH_WAIT_TOKEN
+
+    context.user_data.pop("report_selected_template", None)
+    context.user_data.pop("report_period", None)
+    context.user_data.pop("report_format", None)
+
+    try:
+        templates = _ensure_report_templates(context, client)
+    except Exception as e:
+        log.exception("Ошибка обновления списка шаблонов отчётов при возврате к выбору")
+        await edit_anchor(
+            context,
+            f"Не удалось обновить список отчётов: `{e}`",
+            kb_cancel(),
+            parse_mode="Markdown",
+        )
+        return STATE_REPORT_NAME
+
+    if not templates:
+        await edit_anchor(
+            context,
+            "Шаблоны отчётов недоступны. Попробуйте позже.",
+            kb_cancel(),
+            parse_mode=None,
+        )
+        return STATE_REPORT_NAME
+
+    mask = context.user_data.get("report_search_mask")
+    if mask is None:
+        mask = context.user_data.get("report_last_query") or ""
+
+    text, markup = report_features.build_report_start_prompt(context, templates, mask)
+
+    if context.user_data.get("anchor"):
+        await edit_anchor(context, text, markup, parse_mode=None)
+    else:
+        await delete_anchor(context)
+        if q.message:
+            msg = await q.message.reply_text(text, reply_markup=markup, parse_mode=None)
+            await set_anchor_on(msg, context)
+
+    return STATE_REPORT_NAME
+
+
+async def report_back_to_period_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get("mode") != MODE_REPORT:
+        return STATE_MENU
+
+    q = update.callback_query
+    if not await ensure_authorized(update, context):
+        return STATE_AUTH_WAIT_TOKEN
+    await _safe_answer_callback(q)
+
+    template = context.user_data.get("report_selected_template")
+    if not template:
+        templates = context.user_data.get("report_templates") or []
+        mask = context.user_data.get("report_search_mask") or ""
+        text, markup = report_features.build_report_start_prompt(context, templates, mask)
+        await edit_anchor(context, text, markup, parse_mode=None)
+        return STATE_REPORT_NAME
+
+    label = report_features.format_report_label(template)
+    context.user_data.pop("report_period", None)
+    text = f"Отчёт: {label}\n\nВыберите период формирования:".strip()
+    await edit_anchor(context, text, report_features.kb_report_periods(), parse_mode=None)
+    return STATE_REPORT_PERIOD
+
+
+async def report_period_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get("mode") != MODE_REPORT:
+        return STATE_MENU
+    q = update.callback_query
+    if not await ensure_authorized(update, context):
+        return STATE_AUTH_WAIT_TOKEN
+    await _safe_answer_callback(q)
+
+    parts = (q.data or "").split(":")
+    if len(parts) != 3:
+        return STATE_REPORT_PERIOD
+    key = parts[2]
+
+    template = context.user_data.get("report_selected_template")
+    if not template:
+        await edit_anchor(context, "Сначала выберите отчёт.", kb_cancel(), parse_mode=None)
+        return STATE_REPORT_NAME
+
+    try:
+        interval = build_report_interval(key)
+    except ValueError:
+        await _safe_answer_callback(q, "Неизвестный период", show_alert=True)
+        return STATE_REPORT_PERIOD
+
+    context.user_data["report_period"] = dict(interval)
+    label = interval.get("label") or ""
+    tpl_label = report_features.format_report_label(template)
+    text = (
+        f"Отчёт: {tpl_label}\n"
+        f"Период: {label}\n\n"
+        "Выберите формат выгрузки:"
+    )
+    await edit_anchor(context, text, report_features.kb_report_formats(), parse_mode=None)
+    return STATE_REPORT_FORMAT
+
+async def report_format_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get("mode") != MODE_REPORT:
+        return STATE_MENU
+    q = update.callback_query
+    if not await ensure_authorized(update, context):
+        return STATE_AUTH_WAIT_TOKEN
+    await _safe_answer_callback(q)
+
+    client = await require_wialon_client(update, context, "Чтобы формировать отчёты, авторизуйтесь.")
+    if not client:
+        return STATE_AUTH_WAIT_TOKEN
+
+    parts = (q.data or "").split(":")
+    if len(parts) != 3:
+        return STATE_REPORT_FORMAT
+    fmt_key = parts[2]
+    fmt_cf = fmt_key.lower()
+    try:
+        canonical_fmt, _, _ = WialonClient._resolve_format(fmt_cf)
+    except ValueError:
+        await _safe_answer_callback(q, "Неизвестный формат", show_alert=True)
+        return STATE_REPORT_FORMAT
+
+    template = context.user_data.get("report_selected_template")
+    interval = context.user_data.get("report_period")
+    if not template or not interval:
+        await edit_anchor(context, "Сначала выберите отчёт и период.", kb_cancel(), parse_mode=None)
+        return STATE_REPORT_NAME
+
+    try:
+        resource_id = int(template.get("resource_id"))
+        template_id = int(template.get("template_id"))
+    except (TypeError, ValueError):
+        context.user_data.pop("report_selected_template", None)
+        context.user_data.pop("report_last_template", None)
+        await edit_anchor(
+            context,
+            "У выбранного шаблона некорректные параметры. Введите название отчёта ещё раз.",
+            kb_cancel(),
+            parse_mode=None,
+        )
+        return STATE_REPORT_NAME
+
+    try:
+        interval_from = int(interval.get("from"))
+        interval_to = int(interval.get("to"))
+    except (TypeError, ValueError):
+        await edit_anchor(
+            context,
+            "Некорректный период отчёта. Выберите период ещё раз.",
+            report_features.kb_report_periods(),
+            parse_mode=None,
+        )
+        return STATE_REPORT_PERIOD
+
+    unit_id_raw = context.user_data.get("report_unit_id")
+    try:
+        unit_id_val = int(unit_id_raw) if unit_id_raw is not None else None
+    except (TypeError, ValueError):
+        await edit_anchor(
+            context,
+            "Не удалось определить объект для отчёта. Нажмите «🔍 Найти объект» и выберите его заново.",
+            markup=None,
+            parse_mode=None,
+        )
+        clear_report_context(context, cancel_job=False)
+        context.user_data["mode"] = MODE_NONE
+        context.user_data.pop("anchor", None)
+        if q.message:
+            await q.message.reply_text(
+                "Не удалось определить объект для отчёта. Нажмите «🔍 Найти объект».",
+                reply_markup=reply_menu(chat_id=q.message.chat_id),
+            )
+        return STATE_MENU
+
+    sanitized_template = dict(template)
+    sanitized_template["resource_id"] = resource_id
+    sanitized_template["template_id"] = template_id
+    sanitized_interval = dict(interval)
+    sanitized_interval["from"] = interval_from
+    sanitized_interval["to"] = interval_to
+    context.user_data["report_selected_template"] = sanitized_template
+    context.user_data["report_period"] = sanitized_interval
+
+    format_title = report_features.describe_report_format(canonical_fmt)
+    tpl_label = report_features.format_report_label(sanitized_template)
+    period_label = sanitized_interval.get("label") or ""
+    text = (
+        f"Отчёт: {tpl_label}\n"
+        f"Период: {period_label}\n"
+        f"Формат: {format_title}\n\n"
+        "⏳ Формирование отчёта, подождите…"
+    )
+    await edit_anchor(context, text, report_features.kb_report_wait(), parse_mode=None)
+
+    cancel_event = threading.Event()
+    unit_meta = context.user_data.get("report_unit_meta")
+    job = {
+        "template": dict(sanitized_template),
+        "period": dict(sanitized_interval),
+        "format": canonical_fmt,
+        "chat_id": q.message.chat_id if q.message else (update.effective_chat.id if update.effective_chat else None),
+        "cancel_event": cancel_event,
+        "final_message_sent": False,
+        "unit_id": unit_id_val,
+        "unit": dict(unit_meta) if isinstance(unit_meta, dict) else None,
+    }
+    context.user_data["report_job"] = job
+
+    async def _run() -> None:
+        await report_generation_worker(context, job)
+
+    task = context.application.create_task(_run())
+    job["task"] = task
+
+    try:
+        client.http.close()
+    except Exception:
+        pass
+
+    return STATE_REPORT_WAIT
+
+async def report_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get("mode") != MODE_REPORT:
+        return STATE_MENU
+    q = update.callback_query
+    if not await ensure_authorized(update, context):
+        return STATE_AUTH_WAIT_TOKEN
+    await _safe_answer_callback(q)
+
+    job = context.user_data.get("report_job")
+    if isinstance(job, dict):
+        event = job.get("cancel_event")
+        if isinstance(event, threading.Event):
+            event.set()
+        job["final_message_sent"] = True
+
+    await edit_anchor(context, "❌ Формирование отчёта отменено.", markup=None, parse_mode=None)
+    context.user_data.pop("anchor", None)
+    await delete_stats_message(context)
+    await params_features.delete_param_result_message(context)
+    params_features.clear_param_runtime(context)
+    context.user_data.pop("report_job", None)
+    clear_report_context(context, cancel_job=False)
+    if q.message:
+        await q.message.reply_text(
+            "Формирование отчёта отменено.",
+            reply_markup=reply_menu(chat_id=q.message.chat_id),
+        )
+    return ConversationHandler.END
+
+async def report_wait_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await ensure_authorized(update, context):
+        return STATE_AUTH_WAIT_TOKEN
+    job = context.user_data.get("report_job")
+    if job and not job.get("final_message_sent"):
+        await update.message.reply_text(
+            "Отчёт ещё формируется. Нажмите «❌ Отмена», чтобы остановить процесс.",
+            reply_markup=None,
+        )
+        return STATE_REPORT_WAIT
+
+    context.user_data.pop("report_job", None)
+    clear_report_context(context, cancel_job=False)
+    context.user_data["mode"] = MODE_NONE
+    await update.message.reply_text(
+        "Диалог завершён. Нажмите «🔍 Найти объект», чтобы продолжить поиск.",
+        reply_markup=reply_menu(chat_id=update.effective_chat.id if update.effective_chat else None),
+    )
+    return ConversationHandler.END
+
+async def report_generation_worker(context: ContextTypes.DEFAULT_TYPE, job: Dict[str, Any]) -> None:
+    template = job.get("template") or {}
+    period = job.get("period") or {}
+    fmt = job.get("format") or "pdf"
+    cancel_event = job.get("cancel_event") if isinstance(job.get("cancel_event"), threading.Event) else threading.Event()
+    chat_id = job.get("chat_id")
+    unit_info = job.get("unit") if isinstance(job.get("unit"), dict) else {}
+    unit_id_raw = job.get("unit_id")
+    try:
+        unit_id = int(unit_id_raw) if unit_id_raw is not None else None
+    except (TypeError, ValueError):
+        unit_id = None
+
+    client: Optional[WialonClient] = None
+    try:
+        if chat_id is None:
+            raise NotAuthorized("chat_id missing for report job")
+
+        try:
+            client = wialon_for_chat(int(chat_id))
+        except UserBlocked:
+            if not job.get("final_message_sent"):
+                await edit_anchor(context, "❌ Пользователь заблокирован. Отчёт не сформирован.", markup=None, parse_mode=None)
+                context.user_data.pop("anchor", None)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="🚫 Вы заблокированы. Обратитесь к администратору.",
+                    reply_markup=reply_menu(chat_id=chat_id),
+                )
+            return
+        except NotAuthorized:
+            if not job.get("final_message_sent"):
+                await edit_anchor(
+                    context,
+                    "❌ Не удалось сформировать отчёт: требуется авторизация.",
+                    markup=None,
+                    parse_mode=None,
+                )
+                context.user_data.pop("anchor", None)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="Для формирования отчётов авторизуйтесь заново.",
+                    reply_markup=reply_menu(chat_id=chat_id),
+                )
+            return
+
+        result = await run_blocking(
+            client.generate_report_file,
+            int(template.get("resource_id", 0)),
+            int(template.get("template_id", 0)),
+            int(period.get("from", 0)),
+            int(period.get("to", 0)),
+            fmt,
+            cancel_event,
+            object_id=unit_id,
+        )
+
+        if job.get("final_message_sent"):
+            return
+
+        if not result:
+            raise RuntimeError("Пустой результат отчёта")
+
+        filename, content = result
+        summary_lines: List[str] = []
+        if unit_id is not None:
+            unit_name = (unit_info.get("nm") or "").strip()
+            if unit_name:
+                summary_lines.append(f"Объект: {unit_name} (id {unit_id})")
+            else:
+                summary_lines.append(f"Объект id {unit_id}")
+        summary_lines.extend(
+            [
+                f"Отчёт: {report_features.format_report_label(template)}",
+                f"Период: {period.get('label', '')}",
+                f"Формат: {report_features.describe_report_format(fmt)}",
+            ]
+        )
+        summary = "\n".join(summary_lines)
+        has_unit = unit_id is not None
+        await edit_anchor(
+            context,
+            f"{summary}\n\n✅ Отчёт готов.",
+            markup=report_features.kb_report_finish(has_unit),
+            parse_mode=None,
+        )
+        context.user_data.pop("anchor", None)
+
+        file_obj = io.BytesIO(content)
+        file_obj.name = filename
+        file_obj.seek(0)
+        if chat_id is not None:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=file_obj,
+                caption=summary,
+                reply_markup=reply_menu(chat_id=chat_id),
+            )
+    except ReportCancelledError:
+        if not job.get("final_message_sent"):
+            await edit_anchor(context, "❌ Формирование отчёта отменено.", markup=None, parse_mode=None)
+            context.user_data.pop("anchor", None)
+            if chat_id is not None:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="Формирование отчёта отменено.",
+                    reply_markup=reply_menu(chat_id=chat_id),
+                )
+    except Exception as e:
+        log.exception("Ошибка формирования отчёта")
+        if not job.get("final_message_sent"):
+            error_text = str(e)
+            await edit_anchor(
+                context,
+                f"Ошибка формирования отчёта: {error_text}",
+                markup=None,
+                parse_mode=None,
+            )
+            context.user_data.pop("anchor", None)
+            if chat_id is not None:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="Не удалось сформировать отчёт.",
+                    reply_markup=reply_menu(chat_id=chat_id),
+                )
+    finally:
+        if client:
+            try:
+                client.http.close()
+            except Exception:
+                pass
+        context.user_data.pop("report_job", None)
+        clear_report_context(context, cancel_job=False)
+        job["final_message_sent"] = True
+
+def kb_stats_actions_with_refresh() -> InlineKeyboardMarkup:
+    base = kb_stats_actions()
+    try:
+        rows = [list(row) for row in base.inline_keyboard]
+    except Exception:
+        rows = []
+    rows.append(
+        [
+            InlineKeyboardButton("🔄 Обновить", callback_data="stats:refresh"),
+            InlineKeyboardButton("↩️ К списку", callback_data="stats:to_list"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+params_handler_deps = params_features.ParamsHandlerDeps(
+    ensure_authorized=ensure_authorized,
+    safe_answer_callback=_safe_answer_callback,
+    send_prompt_cb=send_param_prompt,
+    update_prompt_cb=update_param_prompt,
+    delete_anchor_cb=delete_anchor,
+    set_anchor_cb=set_anchor_on,
+    delete_stats_message=delete_stats_message,
+    clear_stats_buttons=clear_stats_buttons,
+    remove_reply_markup_safe=remove_reply_markup_safe,
+    remove_reply_markup_by_meta=remove_reply_markup_by_meta,
+    kb_cancel=kb_cancel,
+    kb_cmd_entry_controls=kb_cmd_entry_controls,
+    reply_menu=reply_menu,
+    require_wialon_client=require_wialon_client,
+    pipeline_card_enabled=_pipeline_card_enabled,
+    show_stats_then_actions=show_stats_then_actions,
+    clear_export_job=_clear_export_job,
+    state_menu=STATE_MENU,
+    state_param_query=STATE_PARAM_QUERY,
+    state_auth_wait_token=STATE_AUTH_WAIT_TOKEN,
+    state_find_query=STATE_FIND_QUERY,
+    state_cmd_value=STATE_CMD_VALUE,
+    mode_params=MODE_PARAMS,
+    mode_none=MODE_NONE,
+    mode_cmd=MODE_CMD,
+)
+params_query_text = params_features.build_params_query_handler(params_handler_deps)
+params_buttons_cb = params_features.build_params_buttons_handler(params_handler_deps)
+
+sensor_handler_deps = sensor_features.SensorsFeatureDeps(
+    safe_answer_callback=_safe_answer_callback,
+    load_unit_config=_load_unit_config,
+    exports_dir=SENSOR_EXPORTS_DIR,
+    state_wait_unit=STATE_WAIT_UNIT,
+)
+show_sensor_settings = sensor_features.build_show_sensor_settings_handler(sensor_handler_deps)
+
+clear_sensors_deps = sensor_features.ClearSensorsDeps(
+    safe_answer_callback=_safe_answer_callback,
+    pipeline_card_enabled=_pipeline_card_enabled,
+    ensure_unit_config_object=_ensure_unit_config_object,
+    save_unit_config=lambda cfg: get_unit_config_service().save(cfg),
+    clear_unit_config_cache=_clear_unit_config_cache,
+    exports_dir=SENSOR_EXPORTS_DIR,
+    show_stats_then_actions=show_stats_then_actions,
+    state_wait_unit=STATE_WAIT_UNIT,
+)
+clear_unit_sensors = sensor_features.build_clear_sensors_handler(clear_sensors_deps)
+
+dut_view_deps = dut_features.DutCalibrationViewDeps(
+    safe_answer_callback=_safe_answer_callback,
+    load_unit_config=_load_unit_config,
+    state_wait_unit=STATE_WAIT_UNIT,
+    log=log,
+    dut_log=dut_cal_log,
+)
+show_dut_calibration = dut_features.build_show_calibration_handler(dut_view_deps)
+
+dut_refresh_deps = dut_features.DutCalibrationRefreshDeps(
+    safe_answer_callback=_safe_answer_callback,
+    ensure_unit_config_object=_ensure_unit_config_object,
+    save_unit_config=lambda cfg: get_unit_config_service().save(cfg),
+    clear_unit_config_cache=_clear_unit_config_cache,
+    wialon_for_chat=wialon_for_chat,
+    not_authorized_exc=NotAuthorized,
+    user_blocked_exc=UserBlocked,
+    run_blocking=run_blocking,
+    log=log,
+    dut_log=dut_cal_log,
+    state_wait_unit=STATE_WAIT_UNIT,
+    show_calibration_handler=show_dut_calibration,
+)
+refresh_dut_calibration = dut_features.build_refresh_calibration_handler(dut_refresh_deps)
+
+add_dut_start = dut_admin_features.build_add_dut_start_handler(
+    dut_admin_features.AddDutStartDeps(
+        safe_answer_callback=_safe_answer_callback,
+        kb_cancel=kb_cancel,
+        state_wait_unit=STATE_WAIT_UNIT,
+        state_add_dut_wait_name=STATE_ADD_DUT_WAIT_NAME,
+        log=log,
+    )
+)
+add_dut_name_text = dut_admin_features.build_add_dut_name_handler(
+    dut_admin_features.AddDutNameDeps(
+        ensure_authorized=ensure_authorized,
+        require_wialon_client=require_wialon_client,
+        run_blocking=run_blocking,
+        pipeline_card_enabled=_pipeline_card_enabled,
+        show_stats_then_actions=show_stats_then_actions,
+        clear_unit_config_cache=_clear_unit_config_cache,
+        ensure_unit_config_object=_ensure_unit_config_object,
+        save_unit_config=lambda cfg: get_unit_config_service().save(cfg),
+        export_calibration_csv=lambda unit_id, sensor: sensor_features.export_sensor_calibration_csv(
+            SENSOR_EXPORTS_DIR, unit_id, sensor
+        ),
+        state_wait_unit=STATE_WAIT_UNIT,
+        state_auth_wait_token=STATE_AUTH_WAIT_TOKEN,
+        state_add_dut_wait_name=STATE_ADD_DUT_WAIT_NAME,
+        log=log,
+    )
+)
+
+# =================== MAIN ===================
+def main() -> None:
+    _start_unit_snapshot_daemon()
+    _bootstrap_unit_snapshot_from_cache()
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("Не указан TELEGRAM_BOT_TOKEN в .env")
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    from admin_panel import AdminPanel
+
+    async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        # Глобальный трап ошибок, чтобы падения не оставались немыми и не прерывали диалог
+        log.exception("unhandled error: %s", context.error, exc_info=context.error)
+        chat_id: Optional[int] = None
+        if isinstance(update, Update) and update.effective_chat:
+            chat_id = update.effective_chat.id
+        if chat_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="Что-то пошло не так. Попробуйте ещё раз, либо отправьте /start.",
+                )
+            except Exception:
+                log.debug("failed to notify user about error", exc_info=True)
+
+    async def send_auth_prompt_to_chat(target_chat_id: int) -> None:
+        try:
+            await app.bot.send_message(chat_id=target_chat_id, text=AUTH_PROMPT_TEXT)
+            await app.bot.send_message(
+                chat_id=target_chat_id,
+                text="Выберите действие:",
+                reply_markup=kb_auth_actions(),
+            )
+        except Exception as exc:
+            log.warning(
+                "Не удалось отправить запрос авторизации пользователю %s: %s",
+                target_chat_id,
+                exc,
+            )
+
+    admin_panel = AdminPanel(
+        token_store=token_store,
+        verify_token_func=verify_wialon_token_sync,
+        prompt_sender=send_auth_prompt_to_chat,
+        admin_whitelist=list(ADMIN_WHITELIST),
+    )
+
+    async def admin_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        remember_user(update)
+        if context.user_data.get("mode") == MODE_EXPORT:
+            _clear_export_job(context, cancel=True)
+            await delete_export_anchor(context)
+            context.user_data["mode"] = MODE_NONE
+        await _suppress_objects_keyboards(context)
+        _set_active_ui(context, UI_ADMIN)
+        chat = update.effective_chat
+        log.info("admin: open_panel user=%s", chat.id if chat else None)
+        await admin_panel.handle_command(update, context)
+
+    async def admin_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if _active_ui(context) != UI_ADMIN:
+            return
+        remember_user(update)
+        _set_active_ui(context, UI_ADMIN)
+        await _suppress_objects_keyboards(context)
+        handled = await admin_panel.handle_text(update, context)
+        if not handled and update.message:
+            chat = update.effective_chat
+            log.debug("admin: ignore free text user=%s", chat.id if chat else None)
+            await update.message.reply_text(
+                "Не удалось распознать ввод для админ-панели."
+            )
+
+    app.add_handler(CommandHandler("admin", admin_command_entry), group=0)
+    app.add_handler(
+        MessageHandler(
+            filters.Regex(f"^{re.escape(MENU_BUTTON_ADMIN)}$"),
+            admin_command_entry,
+            block=True,
+        ),
+        group=0,
+    )
+    async def admin_broadcast_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        remember_user(update)
+        if _active_ui(context) != UI_ADMIN:
+            return
+        _set_active_ui(context, UI_ADMIN)
+        await _suppress_objects_keyboards(context)
+        await admin_panel.handle_broadcast_callback(update, context)
+
+    async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        remember_user(update)
+        if _active_ui(context) != UI_ADMIN:
+            return
+        _set_active_ui(context, UI_ADMIN)
+        await _suppress_objects_keyboards(context)
+        await admin_panel.handle_callback(update, context)
+
+    app.add_handler(
+        CallbackQueryHandler(
+            admin_broadcast_router,
+            pattern=r"^admin:broadcast:(confirm|cancel)$",
+            block=False,
+        ),
+        group=0,
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            admin_callback_router,
+            pattern=r"^adm:.*$",
+            block=False,
+        ),
+        group=0,
+    )
+    admin_text_filter = (
+        filters.TEXT
+        & ~filters.COMMAND
+        & ~filters.Regex(f"^{MENU_BUTTON_FIND}$")
+        & ~filters.Regex(f"^{re.escape(MENU_BUTTON_SETTINGS)}$")
+    )
+    app.add_handler(
+        MessageHandler(
+            admin_text_filter,
+            admin_text_router,
+            block=False,
+        ),
+        group=0,
+    )
+
+    app.add_error_handler(handle_error)
+
+    app.add_handler(
+        MessageHandler(
+            filters.Regex(f"^{re.escape(MENU_BUTTON_SETTINGS)}$"),
+            settings_entry,
+            block=False,
+        ),
+        group=0,
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            settings_buttons_cb,
+            pattern=r"^settings:.*$",
+            block=False,
+        ),
+        group=0,
+    )
+
+    conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", cmd_start),
+            CommandHandler("reports", cmd_reports),
+            CommandHandler("web", cmd_web),
+            CommandHandler("pipeline_summary", pipeline_summary_cmd),
+            MessageHandler(filters.Regex(f"^{MENU_BUTTON_FIND}$"), global_restart),
+            MessageHandler(filters.Regex(r"^🌐 WEB$"), web_button_text),
+            CallbackQueryHandler(stats_actions_cb, pattern=STATS_ACTIONS_PATTERN),
+        ],
+        states={
+            STATE_AUTH_WAIT_TOKEN: [
+                CallbackQueryHandler(auth_callback, pattern=r"^auth:.*$"),
+                MessageHandler(filters.Regex(f"^{re.escape(MENU_BUTTON_SETTINGS)}$"), settings_entry),
+                MessageHandler(filters.Regex(r"^🌐 WEB$"), web_button_text),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, auth_token_text),
+            ],
+            STATE_MENU: [
+                MessageHandler(filters.Regex(f"^{MENU_BUTTON_FIND}$"), global_restart),
+                MessageHandler(filters.Regex(f"^{re.escape(MENU_BUTTON_SETTINGS)}$"), settings_entry),
+                MessageHandler(filters.Regex(r"^🌐 WEB$"), web_button_text),
+                CallbackQueryHandler(start_action_cb, pattern=r"^start:find$"),
+                CallbackQueryHandler(cancel_inline_cb, pattern=r"^action:cancel$"),
+                CallbackQueryHandler(back_cb, pattern=r"^back:.*$"),
+            ],
+            STATE_FIND_QUERY: [
+                MessageHandler(filters.Regex(f"^{MENU_BUTTON_FIND}$"), global_restart),
+                MessageHandler(filters.Regex(f"^{re.escape(MENU_BUTTON_SETTINGS)}$"), settings_entry),
+                MessageHandler(filters.Regex(r"^🌐 WEB$"), web_button_text),
+                CallbackQueryHandler(start_action_cb, pattern=r"^start:find$"),
+                CallbackQueryHandler(cancel_inline_cb, pattern=r"^action:cancel$"),
+                CallbackQueryHandler(back_cb, pattern=r"^back:(menu|find)$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_objects_text),
+            ],
+            STATE_WAIT_UNIT: [
+                MessageHandler(filters.Regex(f"^{MENU_BUTTON_FIND}$"), global_restart),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_objects_text),
+                MessageHandler(filters.Regex(r"^🌐 WEB$"), web_button_text),
+                CallbackQueryHandler(start_action_cb, pattern=r"^start:find$"),
+                CallbackQueryHandler(choose_unit_cb, pattern=r"^(unit:\d+|units:more:\d+)$"),
+                CallbackQueryHandler(
+                    stats_actions_cb,
+                    pattern=STATS_ACTIONS_PATTERN,
+                ),
+                CallbackQueryHandler(cancel_inline_cb, pattern=r"^action:cancel$"),
+                CallbackQueryHandler(back_cb, pattern=r"^back:(find)$"),
+            ],
+            STATE_ADD_DUT_WAIT_NAME: [
+                MessageHandler(filters.Regex(f"^{MENU_BUTTON_FIND}$"), global_restart),
+                MessageHandler(filters.Regex(r"^🌐 WEB$"), web_button_text),
+                CallbackQueryHandler(cancel_inline_cb, pattern=r"^action:cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_dut_name_text),
+            ],
+            STATE_PARAM_QUERY: [
+                MessageHandler(filters.Regex(f"^{MENU_BUTTON_FIND}$"), global_restart),
+                MessageHandler(filters.Regex(r"^🌐 WEB$"), web_button_text),
+                CallbackQueryHandler(cancel_inline_cb, pattern=r"^action:cancel$"),
+                CallbackQueryHandler(back_cb, pattern=r"^back:(menu|find|unit)$"),
+                CallbackQueryHandler(params_buttons_cb, pattern=r"^param:.*$"),
+                CallbackQueryHandler(start_action_cb, pattern=r"^start:find$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, params_query_text),
+            ],
+            STATE_REPORT_NAME: [
+                MessageHandler(filters.Regex(f"^{MENU_BUTTON_FIND}$"), global_restart),
+                MessageHandler(filters.Regex(r"^🌐 WEB$"), web_button_text),
+                CallbackQueryHandler(report_choose_cb, pattern=r"^report:(choose|more):\d+$"),
+                CallbackQueryHandler(start_action_cb, pattern=r"^start:find$"),
+                CallbackQueryHandler(cancel_inline_cb, pattern=r"^action:cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, report_name_text),
+            ],
+            STATE_REPORT_PERIOD: [
+                MessageHandler(filters.Regex(f"^{MENU_BUTTON_FIND}$"), global_restart),
+                MessageHandler(filters.Regex(r"^🌐 WEB$"), web_button_text),
+                CallbackQueryHandler(report_change_template_cb, pattern=r"^report:change$"),
+                CallbackQueryHandler(report_period_cb, pattern=r"^report:period:(today|yesterday|7days|month)$"),
+                CallbackQueryHandler(report_choose_cb, pattern=r"^report:(choose|more):\d+$"),
+                CallbackQueryHandler(cancel_inline_cb, pattern=r"^action:cancel$"),
+                CallbackQueryHandler(start_action_cb, pattern=r"^start:find$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, report_name_text),
+            ],
+            STATE_REPORT_FORMAT: [
+                MessageHandler(filters.Regex(f"^{MENU_BUTTON_FIND}$"), global_restart),
+                MessageHandler(filters.Regex(r"^🌐 WEB$"), web_button_text),
+                CallbackQueryHandler(report_format_cb, pattern=r"^report:format:(pdf|excel)$"),
+                CallbackQueryHandler(report_back_to_period_cb, pattern=r"^report:back:period$"),
+                CallbackQueryHandler(report_period_cb, pattern=r"^report:period:(today|yesterday|7days|month)$"),
+                CallbackQueryHandler(cancel_inline_cb, pattern=r"^action:cancel$"),
+                CallbackQueryHandler(start_action_cb, pattern=r"^start:find$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, report_name_text),
+            ],
+            STATE_REPORT_WAIT: [
+                MessageHandler(filters.Regex(f"^{MENU_BUTTON_FIND}$"), global_restart),
+                MessageHandler(filters.Regex(r"^🌐 WEB$"), web_button_text),
+                CallbackQueryHandler(report_cancel_cb, pattern=r"^report:cancel$"),
+                CallbackQueryHandler(cancel_inline_cb, pattern=r"^action:cancel$"),
+                CallbackQueryHandler(start_action_cb, pattern=r"^start:find$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, report_wait_text),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(auth_callback, pattern=r"^auth:.*$"),
+            CallbackQueryHandler(cancel_inline_cb, pattern=r"^action:cancel$"),
+            CallbackQueryHandler(params_buttons_cb, pattern=r"^param:.*$"),
+            CallbackQueryHandler(report_cancel_cb, pattern=r"^report:cancel$"),
+            CallbackQueryHandler(stats_actions_cb, pattern=STATS_ACTIONS_PATTERN),
+            CallbackQueryHandler(back_cb, pattern=r"^back:.*$"),
+            CallbackQueryHandler(start_action_cb, pattern=r"^start:find$"),
+            MessageHandler(filters.Regex(f"^{MENU_BUTTON_FIND}$"), global_restart),
+            MessageHandler(filters.Regex(r"^🌐 WEB$"), web_button_text),
+        ],
+        allow_reentry=False,  # КЛЮЧЕВОЕ: запрещаем ре-энтри, чтобы текст в CF/CMD не перезапускал диалог
+    )
+
+    app.add_handler(conv, group=1)
+
+    log.info(
+        "Бот запущен: entry-point для текста активен, allow_reentry=False; legacy CF/CMD/EXPORT отключены."
+    )
+    app.run_polling(close_loop=False)
+
+
+if __name__ == "__main__":
+    main()

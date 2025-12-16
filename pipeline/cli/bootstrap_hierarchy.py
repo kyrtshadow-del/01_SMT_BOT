@@ -8,7 +8,7 @@ Usage examples (from project root):
     PYTHONPATH=. python3 -m pipeline.cli.bootstrap_hierarchy --set-owner 1001,1002 --node-id 1
 
 Эти команды не используются рантаймом напрямую, но помогают быстро
-заполнить `web_admin.sqlite3` без ручного редактирования БД.
+заполнить таблицы иерархии/прав в Postgres без ручного редактирования БД.
 """
 
 from __future__ import annotations

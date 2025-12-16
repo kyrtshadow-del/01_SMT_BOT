@@ -80,11 +80,11 @@ def import_wlp_to_service(
     unit_id: int,
     service: UnitConfigService,
     source_kind: str = "wialon",
-) -> Path:
+) -> None:
     """Load a .wlp file and persist UnitConfig via UnitConfigService."""
 
     config = load_wlp_unit_config(input_path, unit_id=unit_id, source_kind=source_kind)
-    return service.save(config)
+    service.save(config)
 
 
 def _parse_general(block: Mapping[str, Any]) -> GeneralConfig:

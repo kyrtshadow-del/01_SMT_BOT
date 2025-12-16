@@ -9,9 +9,8 @@
 #   WIALON_IPS_PORT   (default 18081) – local port for Wialon IPS listener
 #   WIALON_IPS_REMOTE (default 18081) – remote port for Wialon IPS (ssh -R)
 #   TUNNEL_SSH_PORT   (default 22)
-#   RUN_UNITS         (default "cached") – arg for run_stream
+#   RUN_UNITS         (explicit IDs for wialon poll mode; empty for push sources)
 #   NO_BOT            (set to 1 to skip bot)
-#   NO_SNAPSHOT       (set to 1 to disable snapshot loop)
 #   NO_WIALON         (set to 1 to skip Wialon IPS listener/tunnel)
 #   IPS_MAX_FUTURE_SEC (default 14400) - max future time tolerance for IPS
 
@@ -48,7 +47,6 @@ fi
 # Explicitly export key vars if set to avoid subshell leakage
 [[ -n "${REDIS_URL:-}" ]] && export REDIS_URL
 [[ -n "${DEVICE_REGISTRY_DSN:-}" ]] && export DEVICE_REGISTRY_DSN
-[[ -n "${DEVICE_REGISTRY_ENABLED:-}" ]] && export DEVICE_REGISTRY_ENABLED
 
 LOCAL_PORT="${LOCAL_PORT:-8088}"
 REMOTE_PORT="${REMOTE_PORT:-8088}"
@@ -57,14 +55,17 @@ WIALON_IPS_REMOTE="${WIALON_IPS_REMOTE:-18081}"
 TUNNEL_HOST="${TUNNEL_HOST:-}"
 TUNNEL_USER="${TUNNEL_USER:-root}"
 TUNNEL_SSH_PORT="${TUNNEL_SSH_PORT:-22}"
-RUN_UNITS="${RUN_UNITS:-cached}"
+WEB_REMOTE="${WEB_REMOTE:-${WEB_PORT:-8000}}"
+RUN_UNITS="${RUN_UNITS:-}"
+# treat legacy values as empty to avoid snapshot-era defaults
+if [[ "${RUN_UNITS}" == "cached" || "${RUN_UNITS}" == "all" ]]; then
+  RUN_UNITS=""
+fi
 NO_BOT="${NO_BOT:-0}"
-NO_SNAPSHOT="${NO_SNAPSHOT:-0}"
 NO_WIALON="${NO_WIALON:-0}"
 WEB_PORT="${WEB_PORT:-8000}"
 NO_WEB="${NO_WEB:-0}"
 IPS_MAX_FUTURE_SEC="${IPS_MAX_FUTURE_SEC:-14400}"
-DEVICE_REGISTRY_ENABLED="${DEVICE_REGISTRY_ENABLED:-0}"
 DEVICE_REGISTRY_DSN="${DEVICE_REGISTRY_DSN:-}"
 REDIS_URL="${REDIS_URL:-}"
 SKIP_TUNNEL="${SKIP_TUNNEL:-0}"
@@ -183,12 +184,18 @@ if [[ "${SKIP_TUNNEL}" != "1" ]]; then
      echo "ERROR: TUNNEL_HOST is required unless SKIP_TUNNEL=1" >&2
      exit 1
   fi
+  if ! command -v autossh >/dev/null 2>&1; then
+    echo "ERROR: autossh not installed. Install it or set SKIP_TUNNEL=1" >&2
+    exit 1
+  fi
   echo "[stack] cleaning remote port ${REMOTE_PORT} on ${TUNNEL_HOST}"
   ssh -p "${TUNNEL_SSH_PORT}" "${TUNNEL_USER}@${TUNNEL_HOST}" "fuser -k ${REMOTE_PORT}/tcp 2>/dev/null || true" || true
   if [[ "${NO_WIALON}" != "1" ]]; then
     echo "[stack] cleaning remote wialon port ${WIALON_IPS_REMOTE} on ${TUNNEL_HOST}"
     ssh -p "${TUNNEL_SSH_PORT}" "${TUNNEL_USER}@${TUNNEL_HOST}" "fuser -k ${WIALON_IPS_REMOTE}/tcp 2>/dev/null || true" || true
   fi
+  echo "[stack] cleaning remote web port ${WEB_REMOTE} on ${TUNNEL_HOST}"
+  ssh -p "${TUNNEL_SSH_PORT}" "${TUNNEL_USER}@${TUNNEL_HOST}" "fuser -k ${WEB_REMOTE}/tcp 2>/dev/null || true" || true
   echo "[stack] starting autossh tunnel"
   AUTOSSH_LOGFILE="${LOG_DIR}/autossh_galileosky.log"
   AUTOSSH_PIDFILE="${LOG_DIR}/autossh_galileosky.pid"
@@ -199,9 +206,17 @@ if [[ "${SKIP_TUNNEL}" != "1" ]]; then
       -p "${TUNNEL_SSH_PORT}" \
       -R "0.0.0.0:${REMOTE_PORT}:localhost:${LOCAL_PORT}" \
       $( [[ "${NO_WIALON}" != "1" ]] && printf -- '-R 0.0.0.0:%s:localhost:%s' "${WIALON_IPS_REMOTE}" "${WIALON_IPS_PORT}" ) \
+      -R "0.0.0.0:${WEB_REMOTE}:localhost:${WEB_PORT}" \
       "${TUNNEL_USER}@${TUNNEL_HOST}" \
       >>"${AUTOSSH_LOGFILE}" 2>&1 &
   echo $! > "${AUTOSSH_PIDFILE}"
+
+  # Verify tunnel after short delay
+  sleep 2
+  if ! ssh -p "${TUNNEL_SSH_PORT}" "${TUNNEL_USER}@${TUNNEL_HOST}" "ss -ltn | grep -E ':${REMOTE_PORT}\\b'" >/dev/null 2>&1; then
+    echo "[stack] ERROR: remote port ${REMOTE_PORT} is not listening after autossh start" >&2
+    exit 1
+  fi
 else
   echo "[stack] SKIP_TUNNEL=1 set: skipping autossh and remote port cleanup"
 fi
@@ -211,7 +226,7 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
   PYTHON_BIN="$(command -v python3)"
 fi
 
-echo "[stack] starting run_all (bot+stream+snapshot)"
+echo "[stack] starting run_all (bot+stream)"
 RUNALL_LOGFILE="${LOG_DIR}/run_all_galileosky.log"
 RUNALL_PIDFILE="${LOG_DIR}/run_all_galileosky.pid"
 if [[ "${NO_WIALON}" == "1" ]]; then
@@ -221,14 +236,14 @@ else
 fi
 cmd=(env "${SOURCE_ENV[@]}" PIPELINE_GALILEOSKY_PORT="${LOCAL_PORT}" IPS_MAX_FUTURE_SEC="${IPS_MAX_FUTURE_SEC}")
 [[ -n "${REDIS_URL}" ]] && cmd+=(REDIS_URL="${REDIS_URL}")
-[[ "${DEVICE_REGISTRY_ENABLED}" == "1" ]] && cmd+=(DEVICE_REGISTRY_ENABLED=1)
 [[ -n "${DEVICE_REGISTRY_DSN}" ]] && cmd+=(DEVICE_REGISTRY_DSN="${DEVICE_REGISTRY_DSN}")
-[[ "${NO_SNAPSHOT}" == "1" ]] && cmd+=(SNAPSHOT_INTERVAL_SEC=0)
 [[ "${NO_WEB}" == "1" ]] && cmd+=(NO_WEB=1) || cmd+=(WEB_PORT="${WEB_PORT}")
-cmd+=(PYTHONPATH=. "${PYTHON_BIN}" pipeline/cli/run_all.py --units "${RUN_UNITS}")
+cmd+=(PYTHONPATH=. "${PYTHON_BIN}" pipeline/cli/run_all.py)
+if [[ -n "${RUN_UNITS}" ]]; then
+  cmd+=(--units "${RUN_UNITS}")
+fi
 [[ "${NO_BOT}" == "1" ]] && cmd+=(--no-bot)
 [[ "${NO_WEB}" == "1" ]] && cmd+=(--no-web)
-[[ "${NO_SNAPSHOT}" == "1" ]] && cmd+=(--no-snapshot)
 
 echo "  -> cmd: (cd ${ROOT} && ${cmd[*]})"
 (cd "${ROOT}" && nohup "${cmd[@]}") >>"${RUNALL_LOGFILE}" 2>&1 &

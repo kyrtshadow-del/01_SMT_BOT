@@ -8,7 +8,7 @@ from pathlib import Path
 
 from pipeline.config.defaults import load_from_env
 from pipeline.engine import SensorCalculator, build_day_summary
-from pipeline.storage.raw_storage import RawStorage
+from pipeline.services.storage_service import get_pipeline_storage_service
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,10 +24,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    config = load_from_env()
-    storage_root = Path(args.storage_root) if args.storage_root else config.storage_root
-    raw_storage = RawStorage(storage_root)
-    events = raw_storage.fetch(args.day)
+    # storage_root пока оставляем для совместимости с конфигом, но читаем события из Postgres
+    if args.storage_root:
+        # При необходимости переопределим PIPELINE_STORAGE_ROOT для корректной инициализации сервисов
+        import os
+        os.environ["PIPELINE_STORAGE_ROOT"] = str(Path(args.storage_root).expanduser())
+    _ = load_from_env()  # загрузим env-конфиг (если нужен)
+    storage = get_pipeline_storage_service()
+    events = storage.fetch_day(args.day)
     calculator = SensorCalculator(
         fuel_param=args.fuel_param,
         fuel_scale=args.fuel_scale,

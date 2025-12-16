@@ -1,4 +1,4 @@
-"""Persistence layer for normalised telemetry events."""
+"""Persistence layer: cold archive for normalised telemetry events (write-only)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 import threading
 import time
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Tuple
 
 from pipeline.events import Event
 import logging
@@ -16,10 +16,10 @@ _log = logging.getLogger("pipeline.raw_storage")
 
 
 class RawStorage:
-    """Simple file-based event storage (JSON lines placeholder).
+    """Simple file-based event storage (JSONL).
 
-    Parquet/Arrow will replace this once the pipeline stabilises, but even эта
-    реализация уже изолирует format от остального кода.
+    Used as cold archive / backup. Primary source of truth is Postgres;
+    reads from these files are only used by offline tools.
     """
 
     def __init__(self, root: Path) -> None:
@@ -32,10 +32,6 @@ class RawStorage:
         # size limit (bytes) for events.jsonl before rotating; default 50 MB, override via env PIPELINE_RAW_MAX_BYTES
         import os
         self._max_bytes = int(float(os.getenv("PIPELINE_RAW_MAX_BYTES", 50 * 1024 * 1024)))
-
-    @staticmethod
-    def day_key(ts: int) -> str:
-        return time.strftime("%Y-%m-%d", time.gmtime(ts))
 
     def _day_path(self, day_key: str) -> Path:
         day_dir = self.root / day_key
@@ -74,29 +70,3 @@ class RawStorage:
             with file_path.open("a", encoding="utf-8") as fh:
                 fh.write(payload)
         return len(buffer)
-
-    def fetch(self, day_key: str, unit_id: int | None = None) -> Sequence[Event]:
-        """Read all events for the specified day."""
-
-        file_path = self._day_path(day_key) / "events.jsonl"
-        if not file_path.exists():
-            return []
-        events: List[Event] = []
-        with file_path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    _log.warning("raw_storage: bad json line skipped day=%s path=%s err=%s", day_key, file_path, exc)
-                    continue
-                if unit_id is not None and payload.get("unit_id") != unit_id:
-                    continue
-                try:
-                    events.append(Event(**payload))
-                except Exception as exc:  # защитимся от битых схем
-                    _log.warning("raw_storage: bad event payload skipped day=%s path=%s err=%s", day_key, file_path, exc)
-                    continue
-        return events

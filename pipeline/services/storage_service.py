@@ -1,22 +1,27 @@
-"""Helpers to access pipeline storage from application code (bot, CLI, etc.)."""
+"""Helpers to access pipeline storage from application code (SQL-first)."""
 
 from __future__ import annotations
 
+import json
+import logging
+import math
+import os
 from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from threading import Lock
-from typing import Dict, List, Optional, Sequence, Any
+from typing import Any, Dict, List, Optional, Sequence
 
-import math
-from collections import defaultdict
-from datetime import datetime, timezone, timedelta
-import os
+import psycopg
+from psycopg.rows import dict_row
 
 from pipeline.config.defaults import PipelineConfig, load_from_env
 from pipeline.events import Event
-from pipeline.storage.raw_storage import RawStorage
-from pipeline.storage.latest_metrics import LatestTelemetryStore
 from pipeline.services.unit_index import get_unit_index
+from pipeline.storage.latest_metrics import LatestTelemetryStore
+from pipeline.storage.raw_storage import RawStorage
+
+log = logging.getLogger("pipeline.storage")
 
 
 @dataclass
@@ -27,79 +32,215 @@ class StoredEvent:
 
 @dataclass
 class PipelineStorageService:
-    """Lightweight wrapper around RawStorage with config awareness."""
+    """SQL-first storage access.
+
+    Reads from PostgreSQL for speed.
+    Writes to both PostgreSQL (hot) and RawStorage (cold backup).
+    """
 
     config: PipelineConfig
     raw_storage: RawStorage
     latest_store: LatestTelemetryStore
+    db_dsn: str
 
     @property
     def storage_root(self) -> Path:
         return self.raw_storage.root
 
-    def fetch_day(self, day: str, unit_id: Optional[int] = None) -> Sequence[Event]:
-        """Return events for a specific day (optionally filtered by unit)."""
+    # ------------------------------------------------------------------ #
+    # Low-level DB helpers                                               #
+    # ------------------------------------------------------------------ #
 
-        return self.raw_storage.fetch(day, unit_id=unit_id)
+    def _get_conn(self) -> psycopg.Connection:
+        """Create a new DB connection.
 
-    def list_days(self) -> Sequence[str]:
-        """List available day directories inside storage root."""
-
-        entries: list[str] = []
-        for item in sorted(self.storage_root.iterdir()):
-            if item.is_dir():
-                entries.append(item.name)
-        return entries
-
-    def find_latest_event(self, unit_id: int, max_days: int = 30) -> Optional[StoredEvent]:
-        """Return the most recent event for a unit across available days."""
-
-        days = sorted((p.name for p in self.storage_root.iterdir() if p.is_dir()), reverse=True)
-        checked = 0
-        for day in days:
-            events = self.raw_storage.fetch(day, unit_id=unit_id)
-            if events:
-                return StoredEvent(day=day, event=events[-1])
-            checked += 1
-            if max_days and checked >= max_days:
-                break
-        return None
-
-    def find_latest_event_fast(self, unit_id: int, *, lookback_days: int | None = None) -> Optional[StoredEvent]:
-        """Fast path: start from latest_metrics day, then bounded lookback.
-
-        - Uses the timestamp from latest_metrics.json to compute the most probable day
-          and reads only that day's file.
-        - If not found, walks back a limited number of days (default from env, else 7).
-        - Falls back to None; caller may use slow path as a backup.
+        For now we rely on simple connections; if needed we can
+        introduce a pool at the process level.
         """
 
-        # Resolve lookback bound from env to keep this change low‑risk and configurable
-        if lookback_days is None:
-            try:
-                lookback_days = int(os.getenv("PIPELINE_STORAGE_LOOKBACK_DAYS", "7"))
-            except ValueError:
-                lookback_days = 7
+        return psycopg.connect(self.db_dsn, row_factory=dict_row)
 
-        latest = self.latest_store.get_latest(unit_id)
-        if not isinstance(latest, dict):
-            return None
-        ts = latest.get("device_ts") or latest.get("received_ts")
+    # ------------------------------------------------------------------ #
+    # Read API                                                           #
+    # ------------------------------------------------------------------ #
+
+    def fetch_period(self, unit_id: int, start_ts: int, end_ts: int) -> Sequence[Event]:
+        """Fetch events for unit from DB between timestamps (inclusive)."""
+
+        events: List[Event] = []
         try:
-            ts = int(ts)
-        except (TypeError, ValueError):
-            return None
-        # Walk chosen day, then bounded previous days
-        base_day = datetime.fromtimestamp(ts, tz=timezone.utc).date()
-        for d in range(0, max(0, lookback_days)):
-            day_key = (base_day - timedelta(days=d)).isoformat()
-            events = self.raw_storage.fetch(day_key, unit_id=unit_id)
-            if events:
-                return StoredEvent(day=day_key, event=events[-1])
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT
+                      unit_id,
+                      EXTRACT(EPOCH FROM device_ts)::bigint AS device_ts,
+                      EXTRACT(EPOCH FROM received_ts)::bigint AS received_ts,
+                      lat,
+                      lon,
+                      speed,
+                      course,
+                      params,
+                      raw
+                    FROM events
+                    WHERE unit_id = %s
+                      AND device_ts >= to_timestamp(%s)
+                      AND device_ts <= to_timestamp(%s)
+                    ORDER BY device_ts ASC
+                    """,
+                    (unit_id, start_ts, end_ts),
+                )
+                for row in cur.fetchall():
+                    events.append(
+                        Event(
+                            unit_id=row["unit_id"],
+                            device_ts=int(row["device_ts"]),
+                            received_ts=int(row["received_ts"] or row["device_ts"]),
+                            latitude=row["lat"],
+                            longitude=row["lon"],
+                            speed=row["speed"],
+                            course=row["course"],
+                            params=row.get("params") or {},
+                            source="db",
+                            raw_payload=row.get("raw"),
+                        )
+                    )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.error("DB fetch_period error unit_id=%s err=%s", unit_id, exc)
+        return events
+
+    def fetch_day(self, day: str, unit_id: Optional[int] = None) -> Sequence[Event]:
+        """Fetch history for a given day from Postgres.
+
+        - With unit_id → read from DB (primary path).
+        - Without unit_id → read all units for that day from DB.
+        """
+
+        try:
+            dt_start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return []
+        start_ts = int(dt_start.timestamp())
+        end_ts = start_ts + 86400
+
+        if unit_id is not None:
+            return self.fetch_period(unit_id, start_ts, end_ts)
+
+        events: List[Event] = []
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT
+                      unit_id,
+                      EXTRACT(EPOCH FROM device_ts)::bigint AS device_ts,
+                      EXTRACT(EPOCH FROM received_ts)::bigint AS received_ts,
+                      lat,
+                      lon,
+                      speed,
+                      course,
+                      params,
+                      raw
+                    FROM events
+                    WHERE device_ts >= to_timestamp(%s)
+                      AND device_ts < to_timestamp(%s)
+                    ORDER BY device_ts ASC
+                    """,
+                    (start_ts, end_ts),
+                )
+                for row in cur.fetchall():
+                    events.append(
+                        Event(
+                            unit_id=row["unit_id"],
+                            device_ts=row["device_ts"],
+                            received_ts=row["received_ts"],
+                            latitude=row["lat"],
+                            longitude=row["lon"],
+                            speed=row["speed"],
+                            course=row["course"],
+                            params=row.get("params") or {},
+                            source="db",
+                            raw_payload=row.get("raw"),
+                        )
+                    )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.error("DB fetch_day(all units) error day=%s err=%s", day, exc)
+        return events
+
+    def list_days(self) -> Sequence[str]:
+        """List distinct days that have events in Postgres."""
+
+        days: List[str] = []
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT DISTINCT to_char(device_ts::date, 'YYYY-MM-DD') AS day
+                    FROM events
+                    ORDER BY day
+                    """
+                )
+                for row in cur.fetchall():
+                    days.append(row["day"])
+        except Exception as exc:  # pragma: no cover - defensive
+            log.error("DB list_days error: %s", exc)
+        return days
+
+    def find_latest_event(self, unit_id: int, max_days: int = 30) -> Optional[StoredEvent]:  # noqa: ARG002
+        """Return strict latest event for unit from DB."""
+
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT
+                      unit_id,
+                      EXTRACT(EPOCH FROM device_ts)::bigint AS device_ts,
+                      lat,
+                      lon,
+                      speed,
+                      course,
+                      params
+                    FROM events
+                    WHERE unit_id = %s
+                    ORDER BY device_ts DESC
+                    LIMIT 1
+                    """,
+                    (unit_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                ts = int(row["device_ts"])
+                ev = Event(
+                    unit_id=row["unit_id"],
+                    device_ts=ts,
+                    received_ts=ts,
+                    latitude=row["lat"],
+                    longitude=row["lon"],
+                    speed=row["speed"],
+                    course=row["course"],
+                    params=row.get("params") or {},
+                    source="db",
+                )
+                day_key = datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+                return StoredEvent(day=day_key, event=ev)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.error("DB latest fetch error unit_id=%s err=%s", unit_id, exc)
         return None
 
+    def find_latest_event_fast(self, unit_id: int, *, lookback_days: int | None = None) -> Optional[StoredEvent]:  # noqa: ARG002
+        """Fast path: in SQL version same as strict latest (indexed)."""
+
+        return self.find_latest_event(unit_id)
+
     def get_latest_event_from_metrics(self, unit_id: int) -> Optional[StoredEvent]:
-        """Construct the latest Event directly from latest_metrics.json without reading files."""
+        """Construct the latest Event directly from latest_metrics cache."""
+
         payload = self.latest_store.get_latest(unit_id)
         if not isinstance(payload, dict):
             return None
@@ -125,22 +266,23 @@ class PipelineStorageService:
             course=course,
             params=params,
             source="latest_metrics",
-            raw_payload=dict(params=params, device_ts=device_ts, received_ts=received_ts),
+            raw_payload={"params": params, "device_ts": device_ts, "received_ts": received_ts},
         )
         day_key = datetime.fromtimestamp(device_ts, tz=timezone.utc).date().isoformat()
         return StoredEvent(day=day_key, event=event)
 
     def get_latest_metrics(self, unit_id: int) -> Optional[dict]:
+        """Return cached latest metrics, falling back to DB if needed."""
+
         payload = self.latest_store.get_latest(unit_id)
         if payload:
             return dict(payload)
-        # fallback: derive from recent events if latest_metrics entry is missing
-        fallback = self.find_latest_event_fast(unit_id)
-        if fallback and fallback.event:
-            ev = fallback.event
+
+        last = self.find_latest_event(unit_id)
+        if last and last.event:
+            ev = last.event
             return {
                 "device_ts": ev.device_ts,
-                "received_ts": ev.received_ts,
                 "lat": ev.latitude,
                 "lon": ev.longitude,
                 "speed": ev.speed,
@@ -158,6 +300,8 @@ class PipelineStorageService:
         *,
         exclude_unit_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        """Find units near the given coordinates using latest telemetry cache."""
+
         if lat is None or lon is None:
             return []
         entries = list(self.latest_store.iter_latest())
@@ -185,57 +329,78 @@ class PipelineStorageService:
         results.sort(key=lambda entry: entry["distance_m"])
         return results[:limit]
 
+    # ------------------------------------------------------------------ #
+    # Write API                                                          #
+    # ------------------------------------------------------------------ #
+
     def store_events(self, events: Sequence[Event]) -> int:
-        """Persist events into raw storage and refresh latest metrics."""
+        """Persist events: hot to DB, cold to files, update latest cache."""
 
         if not events:
             return 0
-        # Optional: also write to Postgres (for trips/history) if DSN provided
-        db_dsn = os.getenv("DEVICE_REGISTRY_DSN") or os.getenv("DATABASE_URL")
 
-        grouped = defaultdict(list)
-        for event in events:
-            day_key = datetime.fromtimestamp(event.device_ts, tz=timezone.utc).date().isoformat()
-            grouped[day_key].append(event)
-        total = 0
+        # 1) Cold archive: group by day and append to RawStorage
+        grouped: Dict[str, List[Event]] = {}
+        for ev in events:
+            day_key = datetime.fromtimestamp(ev.device_ts, tz=timezone.utc).date().isoformat()
+            grouped.setdefault(day_key, []).append(ev)
+
         for day_key, chunk in grouped.items():
-            total += self.raw_storage.append(day_key, chunk)
-
-        if db_dsn:
             try:
-                import psycopg
+                self.raw_storage.append(day_key, chunk)
+            except Exception as exc:  # pragma: no cover - defensive
+                log.error("RawStorage append failed day=%s err=%s", day_key, exc)
 
-                rows = []
-                for ev in events:
-                    rows.append(
-                        (
-                            ev.unit_id,
-                            ev.device_ts,
-                            ev.received_ts or ev.device_ts,
-                            ev.latitude,
-                            ev.longitude,
-                            ev.speed,
-                            ev.course,
-                            ev.params or {},
-                            ev.raw_payload or {},
-                        )
+        # 2) Primary storage: insert into Postgres
+        inserted = 0
+        try:
+            rows = []
+            for ev in events:
+                rows.append(
+                    (
+                        ev.unit_id,
+                        datetime.fromtimestamp(ev.device_ts, tz=timezone.utc),
+                        datetime.fromtimestamp(ev.received_ts or ev.device_ts, tz=timezone.utc),
+                        ev.latitude,
+                        ev.longitude,
+                        ev.speed,
+                        ev.course,
+                        json.dumps(ev.params or {}, ensure_ascii=False),
+                        json.dumps(ev.raw_payload or {}, ensure_ascii=False),
                     )
-                if rows:
-                    with psycopg.connect(db_dsn, autocommit=True) as conn:
-                        cur = conn.cursor()
+                )
+            if rows:
+                with self._get_conn() as conn:
+                    with conn.cursor() as cur:
                         cur.executemany(
                             """
-                            INSERT INTO events (unit_id, device_ts, received_ts, lat, lon, speed, course, params, raw)
-                            VALUES (%s, to_timestamp(%s), to_timestamp(%s), %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT DO NOTHING
+                            INSERT INTO events (
+                              unit_id,
+                              device_ts,
+                              received_ts,
+                              lat,
+                              lon,
+                              speed,
+                              course,
+                              params,
+                              raw
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (unit_id, device_ts) DO NOTHING
                             """,
                             rows,
                         )
-            except Exception as exc:  # pragma: no cover
-                _log.warning("raw_storage: failed to insert events into DB: %s", exc)
+                    inserted = len(rows)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.error("DB insert failed for %s events: %s", len(events), exc)
 
-        self.latest_store.update_from_events(events)
-        return total
+        # 3) Update latest telemetry cache for online/nearby checks
+        try:
+            self.latest_store.update_from_events(events)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.error("LatestTelemetryStore update failed: %s", exc)
+
+        return inserted
 
 
 _SERVICE: PipelineStorageService | None = None
@@ -252,12 +417,18 @@ def get_pipeline_storage_service() -> PipelineStorageService:
         if _SERVICE is None:
             config = load_from_env()
             storage_root = Path(config.storage_root)
+
+            dsn = os.getenv("DEVICE_REGISTRY_DSN") or os.getenv("DATABASE_URL")
+            if not dsn:
+                raise ValueError("DATABASE_URL or DEVICE_REGISTRY_DSN env var is required for SQL storage")
+
             raw_storage = RawStorage(storage_root)
             latest_store = LatestTelemetryStore(storage_root)
             _SERVICE = PipelineStorageService(
                 config=config,
                 raw_storage=raw_storage,
                 latest_store=latest_store,
+                db_dsn=dsn,
             )
     return _SERVICE
 

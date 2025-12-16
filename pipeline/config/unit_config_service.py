@@ -1,13 +1,16 @@
-"""Persistence/validation helpers for UnitConfig snapshots."""
+"""Persistence/validation helpers for UnitConfig snapshots (PostgreSQL-backed)."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
 import logging
+import os
 from pathlib import Path
-from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Sequence
+
+import psycopg
+from psycopg.rows import dict_row
 
 try:
     import jsonschema  # type: ignore
@@ -46,73 +49,88 @@ class UnitConfigSummary:
 
 
 class UnitConfigService:
-    """Read/write UnitConfig documents under pipeline storage root."""
+    """Read/write UnitConfig documents in PostgreSQL `unit_configs` table."""
 
     def __init__(
         self,
-        root: Path,
+        dsn: str,
         *,
         schema_path: Optional[Path] = None,
         extra_validators: Optional[Sequence[Callable[[Dict[str, Any]], None]]] = None,
     ) -> None:
-        self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.dsn = dsn
         self.schema_path = schema_path or Path(__file__).with_name("unit_config.schema.json")
         self.schema = self._load_schema(self.schema_path)
         self.extra_validators = list(extra_validators or [])
-        self._locks: Dict[int, Lock] = {}
         self._warned_about_schema = False
+
+    def _get_conn(self):
+        return psycopg.connect(self.dsn, row_factory=dict_row, autocommit=True)
 
     # Public API -----------------------------------------------------
 
-    def save(self, config: UnitConfig) -> Path:
+    def save(self, config: UnitConfig) -> None:
         payload = self.to_dict(config)
         self._validate(payload)
-        path = self._unit_path(config.unit_id)
-        lock = self._lock_for(config.unit_id)
-        with lock:
-            tmp_path = path.with_suffix(".json.tmp")
-            tmp_path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
-            tmp_path.replace(path)
-        return path
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO unit_configs (unit_id, config)
+                    VALUES (%s, %s)
+                    ON CONFLICT (unit_id) DO UPDATE SET config = EXCLUDED.config
+                    """,
+                    (config.unit_id, json.dumps(payload, ensure_ascii=False)),
+                )
 
     def load(self, unit_id: int) -> UnitConfig:
-        path = self._unit_path(unit_id)
-        if not path.exists():
-            raise FileNotFoundError(f"Unit config not found: {path}")
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT config FROM unit_configs WHERE unit_id = %s", (unit_id,))
+                row = cur.fetchone()
+        if not row:
+            # Fallback: return minimal default config instead of raising
+            return UnitConfig(unit_id=unit_id, source_kind="unknown")
+        raw_config = row["config"]
+        if isinstance(raw_config, str):
+            payload = json.loads(raw_config)
+        else:
+            payload = dict(raw_config)
         self._validate(payload)
         return self.from_dict(payload)
 
     def list_configs(self) -> List[UnitConfigSummary]:
         summaries: List[UnitConfigSummary] = []
-        for path in sorted(self.root.glob("*.json")):
-            try:
-                unit_id = int(path.stem)
-            except ValueError:
-                continue
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                LOGGER.warning("unit_config: failed to read %s", path)
-                continue
-            source = payload.get("source_kind", "unknown")
-            summaries.append(
-                UnitConfigSummary(
-                    unit_id=unit_id,
-                    path=path,
-                    updated_ts=path.stat().st_mtime,
-                    source_kind=source,
-                )
-            )
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT unit_id, config, updated_at FROM unit_configs ORDER BY unit_id")
+                for row in cur.fetchall():
+                    unit_id = int(row["unit_id"])
+                    config = row["config"]
+                    if isinstance(config, str):
+                        try:
+                            payload = json.loads(config)
+                        except json.JSONDecodeError:
+                            payload = {}
+                    else:
+                        payload = dict(config or {})
+                    source = payload.get("source_kind", "unknown")
+                    updated_at = row.get("updated_at")
+                    updated_ts = float(updated_at.timestamp()) if updated_at is not None else 0.0
+                    summaries.append(
+                        UnitConfigSummary(
+                            unit_id=unit_id,
+                            path=Path(str(unit_id)),
+                            updated_ts=updated_ts,
+                            source_kind=source,
+                        )
+                    )
         return summaries
 
     def delete(self, unit_id: int) -> None:
-        path = self._unit_path(unit_id)
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            return
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM unit_configs WHERE unit_id = %s", (unit_id,))
 
     # Serialization helpers -----------------------------------------
 
@@ -150,16 +168,6 @@ class UnitConfigService:
         )
 
     # Internal utilities --------------------------------------------
-
-    def _unit_path(self, unit_id: int) -> Path:
-        return self.root / f"{unit_id}.json"
-
-    def _lock_for(self, unit_id: int) -> Lock:
-        lock = self._locks.get(unit_id)
-        if lock is None:
-            lock = Lock()
-            self._locks[unit_id] = lock
-        return lock
 
     def _validate(self, payload: Dict[str, Any]) -> None:
         if "unit_id" not in payload or "source_kind" not in payload:
@@ -333,8 +341,13 @@ def _build_calibration_segment(raw: Dict[str, Any]) -> CalibrationSegment:
     )
 
 
-def load_default_service(storage_root: Path) -> UnitConfigService:
-    """Helper used by consumers that already know pipeline storage root."""
+def load_default_service(storage_root: Optional[Path] = None) -> UnitConfigService:
+    """Helper used by consumers that previously passed pipeline storage root.
 
-    configs_dir = storage_root / "unit_configs"
-    return UnitConfigService(configs_dir)
+    Now uses PostgreSQL DSN from env and ignores storage_root.
+    """
+
+    dsn = os.getenv("DEVICE_REGISTRY_DSN") or os.getenv("DATABASE_URL")
+    if not dsn:
+        raise ValueError("DEVICE_REGISTRY_DSN or DATABASE_URL env var is required for UnitConfigService")
+    return UnitConfigService(dsn)

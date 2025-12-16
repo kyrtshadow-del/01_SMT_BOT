@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterator, List, Sequence, Tuple
 
-from bot_new import WialonClient
+from bot.wialon_client import WialonClient
 
 log = logging.getLogger(__name__)
 

@@ -21,9 +21,11 @@ from pipeline.services.unit_index import get_unit_index
 
 def pick_unit_id() -> int:
     idx = get_unit_index()
-    if not idx:
+    # Берём первый юнит из индексированных (по БД) объектов
+    units = idx.search("", limit=1)
+    if not units:
         raise RuntimeError("unit_index пуст — нет локальных юнитов")
-    first = next(iter(idx.values()))
+    first = units[0]
     return int(first["id"])
 
 

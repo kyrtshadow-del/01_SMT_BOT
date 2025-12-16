@@ -8,7 +8,9 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from bot.constants import FUEL_MAX_VALID_L, FUEL_MIN_VALID_L
 from pipeline.config.unit_config import SensorConfig, UnitConfig
-from pipeline.services.unit_snapshot_service import UnitSnapshotRecord
+from typing import Any, Dict
+
+UnitSnapshotRecord = Dict[str, Any]
 
 __all__ = [
     "format_line_with_link",

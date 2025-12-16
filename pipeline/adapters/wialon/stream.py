@@ -276,6 +276,7 @@ class WialonStreamAdapter:
                         outcomes[unit_id] = False
                         continue
                     if events:
+                        # Persistence is handled by the caller (run_stream); here we only collect events.
                         collected.extend(events)
                     outcomes[unit_id] = bool(events)
                 processed = len(collected) - before
@@ -444,16 +445,3 @@ class WialonStreamAdapter:
             source=self.label,
             raw_payload=payload,
         )
-
-    def _persist(self, events: Iterable[Event]) -> None:
-        batch = list(events)
-        if not batch:
-            return
-        grouped: DefaultDict[str, List[Event]] = defaultdict(list)
-        for event in batch:
-            grouped[_day_key(event.device_ts)].append(event)
-        for day_key, chunk in grouped.items():
-            count = self.raw_storage.append(day_key, chunk)
-            log.info("stream: stored day=%s events=%s", day_key, count)
-        if self.latest_store is not None:
-            self.latest_store.update_from_events(batch)

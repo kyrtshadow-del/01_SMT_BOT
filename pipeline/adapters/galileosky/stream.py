@@ -35,7 +35,6 @@ from pipeline.services.location_enricher import LocationEnricher
 from pipeline.monitoring.health import HealthReporter
 from pipeline.storage.raw_storage import RawStorage
 from pipeline.storage.latest_metrics import LatestTelemetryStore
-from pipeline.services.unit_snapshot_service import UnitSnapshotService
 from pipeline.adapters.galileosky import proto
 from pipeline.adapters.base import StreamAdapter, MetricsMixin
 from logging.handlers import RotatingFileHandler
@@ -79,7 +78,6 @@ class GalileoskyStreamAdapter(StreamAdapter, MetricsMixin):
     _queue: asyncio.Queue[RawPacket] = field(default_factory=asyncio.Queue, init=False, repr=False)
     _health_reporter: HealthReporter | None = field(default=None, init=False, repr=False)
     _server: asyncio.base_events.Server | None = field(default=None, init=False, repr=False)
-    _snapshot: UnitSnapshotService | None = field(default=None, init=False, repr=False)
     _last_metrics_ts: float = field(default_factory=time.perf_counter, init=False, repr=False)
     _metrics_count: int = field(default=0, init=False, repr=False)
     _last_uid: str | None = field(default=None, init=False, repr=False)
@@ -93,7 +91,6 @@ class GalileoskyStreamAdapter(StreamAdapter, MetricsMixin):
         if self.health_report_path is None:
             self.health_report_path = Path("logs/galileosky_ingest_health.json")
         self._health_reporter = HealthReporter(self.health_report_path)
-        self._snapshot = UnitSnapshotService()
         self._setup_logging()
         self._load_dynamic_limits()
 

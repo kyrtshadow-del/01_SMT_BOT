@@ -1,4 +1,4 @@
-"""One-command launcher for bot + streaming + snapshot refresh."""
+"""One-command launcher for bot + streaming + web API."""
 
 from __future__ import annotations
 
@@ -20,18 +20,11 @@ if str(REPO_ROOT) not in sys.path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run Telegram bot, streaming ingestion and snapshot refresh in one terminal"
+        description="Run Telegram bot, streaming ingestion and web API in one terminal"
     )
     parser.add_argument("--units", default="cached", help="Unit set for run_stream (cached/all/@file/id list)")
     parser.add_argument("--no-bot", action="store_true", help="Disable Telegram bot")
-    parser.add_argument(
-        "--snapshot-interval",
-        type=int,
-        default=int(os.getenv("SNAPSHOT_INTERVAL_SEC", "300") or 300),
-        help="Seconds between snapshot refresh runs (0 disables snapshot loop)",
-    )
     parser.add_argument("--no-stream", action="store_true", help="Disable streaming ingestion")
-    parser.add_argument("--no-snapshot", action="store_true", help="Disable snapshot refresh loop")
     parser.add_argument("--no-trips", action="store_true", help="Disable trip detector worker")
     parser.add_argument("--no-web", action="store_true", help="Disable web API/UI (uvicorn)")
     parser.add_argument(
@@ -78,25 +71,6 @@ async def launch_process(name: str, cmd: Iterable[str]) -> asyncio.subprocess.Pr
     )
     asyncio.create_task(stream_subprocess(proc, name))
     return proc
-
-
-async def snapshot_loop(interval: int, stop_event: asyncio.Event) -> None:
-    if interval <= 0:
-        print("[snapshot] disabled")
-        return
-    # Prefer new snapshot v2; fallback to legacy builder for compatibility.
-    cmd = [PYTHON, "-m", "pipeline.cli.build_snapshot_v2"]
-    while not stop_event.is_set():
-        print("[snapshot] running …")
-        proc = await launch_process("snapshot", cmd)
-        await proc.wait()
-        if stop_event.is_set():
-            break
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=interval)
-        except asyncio.TimeoutError:
-            # normal wake-up to run the next snapshot iteration
-            continue
 
 
 async def run_all() -> None:
@@ -157,12 +131,6 @@ async def run_all() -> None:
     else:
         print("[run_all] trip worker disabled")
 
-    snapshot_task: asyncio.Task | None = None
-    if not args.no_snapshot and args.snapshot_interval > 0:
-        snapshot_task = asyncio.create_task(snapshot_loop(args.snapshot_interval, stop_event))
-    else:
-        print("[run_all] snapshot loop disabled")
-
     try:
         await stop_event.wait()
     finally:
@@ -170,10 +138,6 @@ async def run_all() -> None:
             if proc.returncode is None:
                 proc.terminate()
         await asyncio.gather(*(proc.wait() for proc in procs), return_exceptions=True)
-        if snapshot_task:
-            snapshot_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await snapshot_task
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@
 
 - `bot/` — пакет с инфраструктурой бота (логирование, token store, WialonClient) и фиче‑модулями. Уже выделены `bot/features/reports.py`, `bot/features/search.py`, остальные блоки постепенно выносятся сюда.
 - `bot_new.py` — бот: команды, карточки, настройки, локальный поиск, интеграция с pipeline/Wialon (по мере миграции становится тонким glue).
-- `pipeline/services/unit_snapshot_service.py` — единый снапшот (`data/unit_snapshot.json.gz`).
+- `pipeline/services/unit_snapshot_service.py` — legacy‑снапшот (`data/unit_snapshot.json.gz`) как кэш/derived‑данные; в текущей архитектуре основной источник правды — PostgreSQL (`events`/`latest_metrics`/`unit_configs`), снапшот используется только как оффлайн‑инструмент.
 - `pipeline/cli/run_stream.py` (+ `.ps1`) — запуск стриминга/ingestion.
 - `pipeline/config/unit_config.py` — датаклассы UnitConfig (общие поля, HW, сенсоры, калибровки XY и X a b, валидация).
 - `pipeline/adapters/wialon_wlp_import.py`, `pipeline/cli/import_wlp.py` — импорт `.wlp` в UnitConfig/локальное хранилище, дальнейшая работа бота из собственных конфигов.
@@ -24,8 +24,10 @@
 
 ## 4. Правила кода и ключевые зависимости
 - Стиль: PEP8 + type hints, логирование через `logging`.
-- Снапшот формируется только через `UnitSnapshotService`; `data/units.v1.json.gz` удалён.
-- UnitConfig наполняется из `.wlp` (или других источников) собственным импортёром; бот/поиск работают исключительно на локальных данных.
+- **PostgreSQL — единственный источник правды** для `events`, `units`, `unit_configs`, `nodes/users/units_meta` (DSN: `DEVICE_REGISTRY_DSN`/`DATABASE_URL`).
+- `RawStorage` (`data/pipeline_storage/.../*.jsonl`) — только cold‑архив; чтение из файлов не используется в горячем пути (ingest → API → статус).
+- `LatestTelemetryStore` и `unit_snapshot.json.gz` — производные кэши для быстрого старта/поиска; при потере могут быть полностью реконструированы из БД или Wialon‑импорта.
+- UnitConfig хранится в таблице `unit_configs` (JSONB), наполняется из `.wlp` (или других источников) через импортёры; бот/поиск работают исключительно на локальных данных.
 - Перед крупными правками `bot_new.py` — делаем бэкап `bot_new.py.bak.YYYYMMDDHHMMSS`.
 - Env vars: `PIPELINE_WIALON_TOKEN`, `PIPELINE_WIALON_EXTRA_TOKENS`, `PIPELINE_SOURCE_KIND`, `UNIT_DEVICE_*`, `PYTHONPATH`.
 
@@ -150,8 +152,8 @@ c:\bots\mybot
   - авторизация переведена на login/password (`POST /web/api/login`), токены Wialon/бота для входа в WEB больше не используются;
   - сессии (`data/web_v2_sessions/*.json`) привязаны к `user_id/node_id/is_admin`, Monitoring использует их для фильтрации видимости.
 - Иерархия и права:
-  - добавлено SQLite‑хранилище `data/web_admin.sqlite3` (`pipeline/services/admin_storage.py`) с таблицами `nodes`, `users`, `units_meta`, `groups`, `unit_groups`, `user_groups`;
-  - реализованы CLI‑утилиты (`pipeline/cli/bootstrap_hierarchy.py`) для создания корневого узла («Компания»/«Доминант»), назначения `owner_node_id` юнитам, создания пользователей и переименования узлов.
+  - данные иерархии/прав (`nodes`, `users`, `units_meta`) теперь живут в общем PostgreSQL через `pipeline/services/admin_storage.py` (ранее было SQLite‑хранилище `data/web_admin.sqlite3`);
+  - CLI‑утилиты (`pipeline/cli/bootstrap_hierarchy.py`) используются для создания корневого узла («Компания»/«Доминант»), назначения `owner_node_id` юнитам, создания пользователей и переименования узлов.
 - WEB‑фронт:
   - `web/static/v2/app.js` теперь всегда создаёт сессию через login‑модалку (`login/login/password`) и хранит `session_id` в `localStorage`;
   - Monitoring работает только на локальных данных (`unit_snapshot.json.gz`, `latest_metrics.json`, UnitConfig), Wialon‑кэш не используется.
@@ -162,3 +164,13 @@ c:\bots\mybot
 - Следующие шаги:
   - убедиться, что галилеевский ретранслятор шлёт полный поток (через туннель), и по health‑логам видно живой ingestion;
   - добить иерархию/права до уровня админ‑UI и групп ТС (`Избранное`, структуру, archive) поверх уже стабильного ingestion.
+
+## 11. Фронтенд Monitoring (состояние на 2025‑12)
+
+- Основной интерфейс мониторинга — SPA в каталоге `web-ui/` (React + TS + Vite, MapLibre, Tailwind, Framer Motion, Zustand). Старый `web/static/v2` считается legacy и развивается только по необходимости.
+- API Monitoring живёт в `pipeline/api/web_v2.py` и отдаёт JSON под префиксом `/web/api/...`; SPA ходит в них через Vite‑прокси `/api/...` (см. `web-ui/vite.config.ts`).
+- Для единообразного запуска бэкенда используется `scripts/start_galileosky_stack.sh` (ingest + web +, опционально, туннель). Детальный продуктовый vision и roadmap описаны в `README.md`.
+- UX‑акценты текущей версии SPA:
+  - avatar‑to‑checkbox morph без «дыр» и прыжков; клик по аватарке всегда мульти‑селект, в режиме выбора карточка не открывается;
+  - камера карты режиссирует фокус: следит за группой выбранных, клик в пустоту/ESC сбрасывает, кнопка «Следить (N)» включает автотрекинг; тост Shadow Inbox поднят выше (bottom‑32) и имеет больший z‑index, чтобы не перекрывать управление картой.
+  - нижний HUD (`MapHUD`) — единый стек `flex-col-reverse` для follow‑кнопки и Shadow Toast; follow доступна только когда камера сорвана (isCameraLocked=false), тост автоматически сдвигается, если кнопки нет.

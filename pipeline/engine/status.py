@@ -1,12 +1,14 @@
-"""Status helpers for Monitoring (shared between web and bot layers)."""
+"""Status helpers for Monitoring (shared between web and bot layers).
+
+Pure logic only: no file I/O, no JSON caches.
+Calculates: Online/Offline, Status (Moving/Stop), Ignition.
+"""
 
 from __future__ import annotations
 
 import os
 import time
 from typing import Any, Dict, Optional
-from pathlib import Path
-
 
 DEFAULT_ONLINE_THRESHOLD_SEC = 600  # 10 minutes
 DEFAULT_EXPECTED_INTERVAL_SEC = float(os.getenv("EXPECTED_DEFAULT_SEC", 300))  # регламент 5 минут
@@ -19,13 +21,7 @@ K_WARN = float(os.getenv("STATUS_K_WARN", 3))
 K_CRIT = float(os.getenv("STATUS_K_CRIT", 24))
 WARN_MIN_SEC = float(os.getenv("STATUS_WARN_MIN_SEC", 600))  # 10 мин
 CRIT_MIN_SEC = float(os.getenv("STATUS_CRIT_MIN_SEC", 10800))  # 3 часа
-DEFAULT_VOLTAGE_DELTA = 1.0  # минимальный разрыв между «вкл»/«выкл» по напряжению
-DEFAULT_VOLTAGE_ON = 12.2
-DEFAULT_VOLTAGE_OFF = 11.8
 DEFAULT_STOP_TO_PARK_SEC = 300  # 5 минут: всё, что короче, считаем стоянкой
-EXPECTED_STORE = Path("data/expected_interval.json")
-_EXPECTED_CACHE = {}
-_EXPECTED_MTIME: Optional[float] = None
 
 
 def _online_threshold() -> int:
@@ -71,13 +67,9 @@ def infer_has_fuel(snapshot: Dict[str, Any], unit_config: Optional[Dict[str, Any
 
 
 def derive_ignition(params: Dict[str, Any], advanced: Optional[Dict[str, Any]] = None) -> Optional[bool]:
-    """Heuristic ignition detection similar to Wialon, без прямого использования скорости как состояния.
+    """Heuristic ignition detection similar to Wialon."""
 
-    Приоритет: acc/ign → dev_status бит → inputs бит → ручные пороги по напряжению → авто‑порог по напряжению.
-    Скорость используется только для кластеризации при авто‑пороге, но не для прямого решения.
-    """
-
-    def _to_int(val):
+    def _to_int(val: Any) -> Optional[int]:
         if isinstance(val, bool):
             return int(val)
         if isinstance(val, (int, float)):
@@ -104,7 +96,7 @@ def derive_ignition(params: Dict[str, Any], advanced: Optional[Dict[str, Any]] =
         if bit_idx is None:
             try:
                 bit_idx = int(os.getenv("IGNITION_INPUT_BIT", "-1"))
-            except ValueError:
+            except (TypeError, ValueError):
                 bit_idx = -1
         if isinstance(bit_idx, (int, float)) and bit_idx >= 0:
             return bool(inputs & (1 << int(bit_idx)))
@@ -133,41 +125,18 @@ def derive_ignition(params: Dict[str, Any], advanced: Optional[Dict[str, Any]] =
     return None
 
 
-def _load_expected_cache():
-    global _EXPECTED_CACHE, _EXPECTED_MTIME
-    try:
-        mtime = EXPECTED_STORE.stat().st_mtime
-    except OSError:
-        mtime = None
-    if _EXPECTED_CACHE and _EXPECTED_MTIME and mtime and mtime == _EXPECTED_MTIME:
-        return
-    if mtime is None or not EXPECTED_STORE.exists():
-        _EXPECTED_CACHE = {}
-        _EXPECTED_MTIME = mtime
-        return
-    try:
-        import json
-
-        data = json.loads(EXPECTED_STORE.read_text("utf-8"))
-        _EXPECTED_CACHE = {int(k): float(v.get("expected_interval_sec", DEFAULT_EXPECTED_INTERVAL_SEC)) for k, v in data.items() if isinstance(v, dict)}
-        _EXPECTED_MTIME = mtime
-    except Exception:
-        _EXPECTED_CACHE = {}
-        _EXPECTED_MTIME = mtime
-
-
-def _get_expected_from_cache(unit_id: Optional[int]) -> Optional[float]:
-    if unit_id is None:
-        return None
-    _load_expected_cache()
-    return _EXPECTED_CACHE.get(unit_id)
+def _extract_params(latest: Dict[str, Any]) -> Dict[str, Any]:
+    params = latest.get("params") or latest.get("prms")
+    if isinstance(params, dict):
+        return params
+    return {}
 
 
 def compute_status(
     snapshot: Dict[str, Any],
     latest: Dict[str, Any],
     unit_config: Optional[Dict[str, Any]] = None,
-    unit_id: Optional[int] = None,
+    unit_id: Optional[int] = None,  # noqa: ARG001
     *,
     now: Optional[int] = None,
     health_ok: bool = True,
@@ -191,9 +160,6 @@ def compute_status(
     # ---------- expected interval & thresholds ----------
     # ожидаемый интервал: либо из UnitConfig, либо дефолт
     expected_interval = DEFAULT_EXPECTED_INTERVAL_SEC
-    cached_exp = _get_expected_from_cache(unit_id)
-    if cached_exp:
-        expected_interval = cached_exp
     try:
         cfg_adv = unit_config.get("advanced") if isinstance(unit_config, dict) else None
         cfg_val = cfg_adv.get("expected_interval_sec") if isinstance(cfg_adv, dict) else None
@@ -258,6 +224,7 @@ def compute_status(
         or params.get("stop_dur")
         or latest.get("stop_duration_s")
         or latest.get("stop_dur")
+        or latest.get("stop")
     )
     try:
         if stop_duration is not None:
@@ -268,14 +235,13 @@ def compute_status(
         stop_threshold = int(os.getenv("STOP_TO_PARK_SEC", DEFAULT_STOP_TO_PARK_SEC))
     except Exception:
         stop_threshold = DEFAULT_STOP_TO_PARK_SEC
-    # Минимальный порог: стоянка не может быть больше остановки,
-    # поэтому никогда не опускаем границу ниже 5 минут (300 сек).
     if stop_threshold < DEFAULT_STOP_TO_PARK_SEC:
         stop_threshold = DEFAULT_STOP_TO_PARK_SEC
 
     # fallback: если стоим и нет стоп-таймера, используем возраст пакета как нижнюю оценку
     if stop_duration is None and online and spd < 1.0 and age_sec is not None:
         stop_duration = age_sec
+
     def _fmt_duration(sec: Optional[float]) -> Optional[str]:
         if sec is None:
             return None
@@ -351,10 +317,7 @@ def compute_status(
 
     # offline ветка
     if not online:
-        if age_sec > stale_crit:
-            result["status_label"] = f"Нет связи {_fmt_age(age_sec)}"
-        else:
-            result["status_label"] = f"Нет связи {_fmt_age(age_sec)}"
+        result["status_label"] = f"Нет связи {_fmt_age(age_sec)}"
         result["reason"] = "no_connection"
         return result
 
@@ -373,11 +336,5 @@ def compute_status(
     return result
 
 
-def _extract_params(latest: Dict[str, Any]) -> Dict[str, Any]:
-    params = latest.get("params") or latest.get("prms")
-    if isinstance(params, dict):
-        return params
-    return {}
-
-
 __all__ = ["compute_status", "is_online", "infer_has_fuel", "get_online_threshold"]
+

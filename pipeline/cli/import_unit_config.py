@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Optional
 
 from pipeline.adapters.wialon.unit_config_adapter import WialonUnitConfigAdapter
-from pipeline.config.defaults import load_from_env
 from pipeline.config.unit_config_service import load_default_service
 
 
@@ -17,7 +16,6 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--wlp", required=True, help="Path to Wialon .wlp export")
     parser.add_argument("--unit-id", required=True, type=int, help="Numeric unit ID")
     parser.add_argument("--dump-ts", type=int, help="Override dump timestamp (unix seconds)")
-    parser.add_argument("--storage-root", help="Pipeline storage root (defaults to PIPELINE_STORAGE_ROOT)")
     parser.add_argument(
         "--source-kind",
         default="wialon",
@@ -29,17 +27,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
 
-    if args.storage_root:
-        storage_root = Path(args.storage_root).expanduser().resolve()
-    else:
-        storage_root = load_from_env().storage_root
-
     adapter = WialonUnitConfigAdapter(source_kind=args.source_kind)
     config = adapter.from_wlp_file(Path(args.wlp), unit_id=args.unit_id, dump_ts=args.dump_ts)
 
-    service = load_default_service(storage_root)
-    path = service.save(config)
-    print(f"[ok] saved unit config to {path}")
+    service = load_default_service()
+    service.save(config)
+    print(f"[ok] saved unit config for unit_id={args.unit_id} to PostgreSQL")
     return 0
 
 
